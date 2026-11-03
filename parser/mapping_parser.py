@@ -1,411 +1,376 @@
-from parser.port_parser import PortParser
-
-
 class MappingParser:
+    """
+    Parses both legacy and newer IDMC mapping XML structures.
 
-    def __init__(self):
-        self.port_parser = PortParser()
+    Legacy:
+        <Mappings>
+            <Mapping>
+                <SourceInstances>...</SourceInstances>
+                <Transformations>...</Transformations>
+                <TargetInstances>...</TargetInstances>
+                <Links>...</Links>
+            </Mapping>
+        </Mappings>
 
-    # ============================================================
-    # PUBLIC PARSE METHOD
-    # ============================================================
+    New:
+        <Assets>
+            <Mapping id="..." name="...">
+                <Sources>...</Sources>
+                <Transformations>...</Transformations>
+                <Targets>...</Targets>
+                <DataFlowLinks>...</DataFlowLinks>
+            </Mapping>
+        </Assets>
+    """
 
-    def parse(self, folder):
+    def parse(self, parent):
+        """Return normalized mappings from a folder, Assets, or Mapping."""
 
-        mappings_element = folder.find("Mappings")
-
-        if mappings_element is None:
+        if parent is None:
             return []
 
-        mappings = []
+        if parent.tag == "Mapping":
+            mapping_elements = [parent]
 
-        for mapping in mappings_element.findall("Mapping"):
+        elif parent.tag == "Mappings":
+            mapping_elements = parent.findall("Mapping")
 
-            mapping_data = {
-                "name": mapping.get("name"),
-                "description": mapping.get("description"),
-                "attributes": dict(mapping.attrib),
+        else:
+            # New XML: Assets contains Mapping assets.
+            # Legacy XML: Folder contains a Mappings section.
+            mappings_element = parent.find("Mappings")
 
-                "source_instances": [],
-                "transformations": [],
-                "target_instances": [],
-                "links": [],
+            if mappings_element is not None:
+                mapping_elements = mappings_element.findall("Mapping")
+            else:
+                mapping_elements = parent.findall("Mapping")
 
-                "extensions": []
-            }
+        return [
+            self.parse_mapping(element)
+            for element in mapping_elements
+        ]
 
-            # ====================================================
-            # SOURCE INSTANCES
-            # ====================================================
+    def parse_mapping(self, mapping):
+        """Normalize one Mapping element into the pipeline's data model."""
 
-            source_instances_element = mapping.find(
-                "SourceInstances"
-            )
-
-            if source_instances_element is not None:
-
-                for source_instance in source_instances_element.findall(
-                    "SourceInstance"
-                ):
-
-                    source_instance_data = {
-                        "name": source_instance.get("name"),
-                        "source": source_instance.get("source"),
-                        "attributes": dict(
-                            source_instance.attrib
-                        ),
-                        "extensions": []
-                    }
-
-                    # Preserve every child element
-                    for child in source_instance:
-
-                        source_instance_data[
-                            "extensions"
-                        ].append(
-                            self._element_to_dict(child)
-                        )
-
-                    mapping_data[
-                        "source_instances"
-                    ].append(
-                        source_instance_data
-                    )
-
-            # ====================================================
-            # TRANSFORMATIONS
-            # ====================================================
-
-            transformations_element = mapping.find(
-                "Transformations"
-            )
-
-            if transformations_element is not None:
-
-                for transformation in transformations_element.findall(
-                    "Transformation"
-                ):
-
-                    transformation_data = (
-                        self._parse_transformation(
-                            transformation
-                        )
-                    )
-
-                    mapping_data[
-                        "transformations"
-                    ].append(
-                        transformation_data
-                    )
-
-            # ====================================================
-            # TARGET INSTANCES
-            # ====================================================
-
-            target_instances_element = mapping.find(
-                "TargetInstances"
-            )
-
-            if target_instances_element is not None:
-
-                for target_instance in target_instances_element.findall(
-                    "TargetInstance"
-                ):
-
-                    target_instance_data = {
-                        "name": target_instance.get("name"),
-                        "target": target_instance.get("target"),
-                        "attributes": dict(
-                            target_instance.attrib
-                        ),
-                        "ports": [],
-                        "extensions": []
-                    }
-
-                    # ------------------------------------------------
-                    # Parse target ports
-                    # ------------------------------------------------
-
-                    target_instance_data[
-                        "ports"
-                    ] = self.port_parser.parse(
-                        target_instance
-                    )
-
-                    # ------------------------------------------------
-                    # Preserve unknown target elements
-                    # ------------------------------------------------
-
-                    for child in target_instance:
-
-                        if child.tag != "Ports":
-
-                            target_instance_data[
-                                "extensions"
-                            ].append(
-                                self._element_to_dict(child)
-                            )
-
-                    mapping_data[
-                        "target_instances"
-                    ].append(
-                        target_instance_data
-                    )
-
-            # ====================================================
-            # LINKS
-            # ====================================================
-
-            links_element = mapping.find(
-                "Links"
-            )
-
-            if links_element is not None:
-
-                for link in links_element.findall(
-                    "Link"
-                ):
-
-                    link_data = {
-                        "from": link.get("from"),
-                        "to": link.get("to"),
-                        "attributes": dict(
-                            link.attrib
-                        ),
-                        "extensions": []
-                    }
-
-                    # Preserve nested link elements
-                    for child in link:
-
-                        link_data[
-                            "extensions"
-                        ].append(
-                            self._element_to_dict(child)
-                        )
-
-                    mapping_data[
-                        "links"
-                    ].append(
-                        link_data
-                    )
-
-            # ====================================================
-            # UNKNOWN MAPPING ELEMENTS
-            # ====================================================
-
-            known_mapping_elements = {
-                "SourceInstances",
-                "Transformations",
-                "TargetInstances",
-                "Links"
-            }
-
-            for child in mapping:
-
-                if child.tag not in known_mapping_elements:
-
-                    mapping_data[
-                        "extensions"
-                    ].append(
-                        self._element_to_dict(child)
-                    )
-
-            mappings.append(
-                mapping_data
-            )
-
-        return mappings
-
-    # ============================================================
-    # TRANSFORMATION PARSER
-    # ============================================================
-
-    def _parse_transformation(
-        self,
-        transformation
-    ):
-
-        transformation_data = {
-            "name": transformation.get("name"),
-            "type": transformation.get("type"),
-
-            # Preserve ALL transformation attributes
-            "attributes": dict(
-                transformation.attrib
-            ),
-
-            # Parse ports through dedicated parser
-            "ports": self.port_parser.parse(
-                transformation
-            ),
-
-            # Preserve every non-port XML element
+        mapping_data = {
+            "id": mapping.get("id"),
+            "name": mapping.get("name"),
+            "description": mapping.get("description"),
+            "attributes": dict(mapping.attrib),
+            "source_instances": [],
+            "transformations": [],
+            "target_instances": [],
+            "links": [],
             "extensions": []
         }
 
-        # ========================================================
-        # GENERIC ATTRIBUTE NORMALIZATION
-        # ========================================================
-        #
-        # Preserve useful attribute names in normalized form.
-        #
-        # Example:
-        #
-        # lookupSource
-        #     ->
-        # lookup_source
-        #
-        # joinType
-        #     ->
-        # join_type
-        #
-        # But the original attributes remain inside "attributes".
-        # ========================================================
+        # --------------------------------------------------
+        # SOURCES
+        # --------------------------------------------------
 
-        for key, value in transformation.attrib.items():
-
-            normalized_key = self._normalize_key(
-                key
-            )
-
-            if normalized_key not in {
-                "name",
-                "type"
-            }:
-
-                transformation_data[
-                    normalized_key
-                ] = value
-
-        # ========================================================
-        # GENERIC CHILD ELEMENT PARSING
-        # ========================================================
-
-        for child in transformation:
-
-            # Ports are handled separately
-            if child.tag == "Ports":
-                continue
-
-            child_data = self._element_to_dict(
-                child
-            )
-
-            normalized_key = self._normalize_key(
-                child.tag
-            )
-
-            # ----------------------------------------------------
-            # If the element contains only text, expose the text
-            # directly.
-            # ----------------------------------------------------
-
-            text = self._get_element_text(
-                child
-            )
-
-            if text:
-
-                transformation_data[
-                    normalized_key
-                ] = text
-
-            else:
-
-                transformation_data[
-                    normalized_key
-                ] = child_data
-
-            # ----------------------------------------------------
-            # Preserve complete child representation as well.
-            # ----------------------------------------------------
-
-            transformation_data[
-                "extensions"
-            ].append(
-                child_data
-            )
-
-        return transformation_data
-
-    # ============================================================
-    # NORMALIZE XML FIELD NAME
-    # ============================================================
-
-    def _normalize_key(
-        self,
-        value
-    ):
-
-        if not value:
-            return value
-
-        result = []
-
-        for index, character in enumerate(value):
-
-            if (
-                character.isupper()
-                and index > 0
-                and value[index - 1].islower()
-            ):
-                result.append("_")
-
-            result.append(
-                character.lower()
-            )
-
-        return "".join(
-            result
+        sources_element = (
+            mapping.find("Sources")
+            or mapping.find("SourceInstances")
         )
 
-    # ============================================================
-    # GET COMPLETE ELEMENT TEXT
-    # ============================================================
+        # ElementTree elements can evaluate as false when they
+        # have no children. Use explicit None checks instead.
+        if sources_element is None:
+            sources_element = mapping.find("Sources")
 
-    def _get_element_text(
-        self,
-        element
-    ):
+        if sources_element is None:
+            sources_element = mapping.find("SourceInstances")
 
-        text = "".join(
-            element.itertext()
-        ).strip()
+        if sources_element is not None:
+            source_tags = {"Source", "SourceInstance"}
 
-        return text
+            for source in sources_element:
+                if source.tag not in source_tags:
+                    continue
 
-    # ============================================================
-    # GENERIC XML ELEMENT → DICTIONARY
-    # ============================================================
+                source_data = {
+                    "id": source.get("id"),
+                    "name": source.get("name"),
+                    "source": (
+                        source.get("source")
+                        or source.get("object")
+                        or source.get("name")
+                    ),
+                    "object": source.get("object"),
+                    "type": source.get("type"),
+                    "connection": source.get("connection"),
+                    "attributes": dict(source.attrib),
+                    "columns": [],
+                    "extensions": []
+                }
 
-    def _element_to_dict(
-        self,
-        element
-    ):
+                # Support both <Fields><Field/></Fields>
+                # and <Columns><Column/></Columns>.
+                fields_container = source.find("Fields")
+                if fields_container is None:
+                    fields_container = source.find("Columns")
+
+                if fields_container is not None:
+                    field_elements = list(fields_container)
+                else:
+                    field_elements = [
+                        child for child in source
+                        if child.tag in {"Field", "Column"}
+                    ]
+
+                for field in field_elements:
+                    if field.tag not in {"Field", "Column"}:
+                        continue
+
+                    source_data["columns"].append({
+                        "name": field.get("name"),
+                        "datatype": (
+                            field.get("datatype")
+                            or field.get("dataType")
+                        ),
+                        "nullable": field.get("nullable"),
+                        "length": field.get("length"),
+                        "precision": field.get("precision"),
+                        "scale": field.get("scale"),
+                        "attributes": dict(field.attrib),
+                        "extensions": [
+                            self._element_to_dict(child)
+                            for child in field
+                        ]
+                    })
+
+                known_source_children = {
+                    "Fields", "Columns", "Field", "Column"
+                }
+
+                source_data["extensions"] = [
+                    self._element_to_dict(child)
+                    for child in source
+                    if child.tag not in known_source_children
+                ]
+
+                mapping_data["source_instances"].append(source_data)
+
+        # --------------------------------------------------
+        # TRANSFORMATIONS
+        # --------------------------------------------------
+
+        transformations_element = mapping.find("Transformations")
+
+        if transformations_element is not None:
+            for transformation in transformations_element:
+                tag = transformation.tag
+
+                # New XML uses tags such as
+                # ExpressionTransformation and FilterTransformation.
+                # Legacy XML may use <Transformation type="Expression"/>.
+                transformation_type = (
+                    transformation.get("type")
+                    or (
+                        tag[:-14]
+                        if tag.endswith("Transformation")
+                        else tag
+                    )
+                )
+
+                transformation_data = {
+                    "id": transformation.get("id"),
+                    "name": transformation.get("name"),
+                    "type": transformation_type,
+                    "xml_tag": tag,
+                    "attributes": dict(transformation.attrib),
+
+                    # Preserve transformation-specific logic, including
+                    # conditions, derived fields, lookup rules, groupings,
+                    # router groups, rank/window details and DQ rules.
+                    "details": [
+                        self._element_to_dict(child)
+                        for child in transformation
+                    ]
+                }
+
+                # Preserve legacy port metadata if present.
+                transformation_data["ports"] = self._parse_ports(
+                    transformation
+                )
+
+                mapping_data["transformations"].append(
+                    transformation_data
+                )
+
+        # --------------------------------------------------
+        # TARGETS
+        # --------------------------------------------------
+
+        targets_element = mapping.find("Targets")
+        if targets_element is None:
+            targets_element = mapping.find("TargetInstances")
+
+        if targets_element is not None:
+            for target in targets_element:
+                if target.tag not in {"Target", "TargetInstance"}:
+                    continue
+
+                target_data = {
+                    "id": target.get("id"),
+                    "name": target.get("name"),
+                    "target": (
+                        target.get("target")
+                        or target.get("object")
+                        or target.get("name")
+                    ),
+                    "object": target.get("object"),
+                    "type": target.get("type"),
+                    "connection": target.get("connection"),
+                    "catalog": target.get("catalog"),
+                    "schema": target.get("schema"),
+                    "operation": target.get("operation"),
+                    "attributes": dict(target.attrib),
+                    "columns": [],
+                    "extensions": []
+                }
+
+                fields_container = target.find("Fields")
+                if fields_container is None:
+                    fields_container = target.find("Columns")
+
+                if fields_container is not None:
+                    field_elements = list(fields_container)
+                else:
+                    field_elements = [
+                        child for child in target
+                        if child.tag in {"Field", "Column"}
+                    ]
+
+                for field in field_elements:
+                    if field.tag not in {"Field", "Column"}:
+                        continue
+
+                    target_data["columns"].append({
+                        "name": field.get("name"),
+                        "datatype": (
+                            field.get("datatype")
+                            or field.get("dataType")
+                        ),
+                        "nullable": field.get("nullable"),
+                        "length": field.get("length"),
+                        "precision": field.get("precision"),
+                        "scale": field.get("scale"),
+                        "attributes": dict(field.attrib),
+                        "extensions": [
+                            self._element_to_dict(child)
+                            for child in field
+                        ]
+                    })
+
+                known_target_children = {
+                    "Fields", "Columns", "Field", "Column"
+                }
+
+                target_data["extensions"] = [
+                    self._element_to_dict(child)
+                    for child in target
+                    if child.tag not in known_target_children
+                ]
+
+                mapping_data["target_instances"].append(target_data)
+
+        # --------------------------------------------------
+        # LINKS
+        # --------------------------------------------------
+
+        links_element = mapping.find("DataFlowLinks")
+        if links_element is None:
+            links_element = mapping.find("Links")
+
+        if links_element is not None:
+            for link in links_element.findall("Link"):
+                mapping_data["links"].append({
+                    "from": link.get("from"),
+                    "to": link.get("to"),
+                    "attributes": dict(link.attrib),
+                    "extensions": [
+                        self._element_to_dict(child)
+                        for child in link
+                    ]
+                })
+
+        # --------------------------------------------------
+        # OTHER MAPPING-LEVEL METADATA
+        # --------------------------------------------------
+
+        known_sections = {
+            "Sources",
+            "SourceInstances",
+            "Transformations",
+            "Targets",
+            "TargetInstances",
+            "DataFlowLinks",
+            "Links"
+        }
+
+        mapping_data["extensions"] = [
+            self._element_to_dict(child)
+            for child in mapping
+            if child.tag not in known_sections
+        ]
+
+        return mapping_data
+
+    def _parse_ports(self, transformation):
+        """Keep legacy direct and container-based port definitions."""
+
+        ports = []
+        ports_container = transformation.find("Ports")
+
+        if ports_container is not None:
+            port_elements = ports_container.findall("Port")
+        else:
+            port_elements = transformation.findall("Port")
+
+        for port in port_elements:
+            expression = port.get("expression")
+            expression_element = port.find("Expression")
+
+            if expression_element is not None:
+                text = "".join(expression_element.itertext()).strip()
+                if text:
+                    expression = text
+
+            ports.append({
+                "name": port.get("name"),
+                "datatype": (
+                    port.get("datatype")
+                    or port.get("dataType")
+                ),
+                "direction": port.get("direction"),
+                "expression": expression,
+                "attributes": dict(port.attrib),
+                "extensions": [
+                    self._element_to_dict(child)
+                    for child in port
+                    if child.tag != "Expression"
+                ]
+            })
+
+        return ports
+
+    def _element_to_dict(self, element):
+        """Recursively preserve XML attributes, text and child elements."""
 
         data = {
             "tag": element.tag,
-            "attributes": dict(
-                element.attrib
-            ),
+            "attributes": dict(element.attrib),
             "children": []
         }
 
         if element.text and element.text.strip():
-
-            data["text"] = (
-                element.text.strip()
-            )
+            data["text"] = element.text.strip()
 
         for child in element:
-
-            data[
-                "children"
-            ].append(
-                self._element_to_dict(
-                    child
-                )
+            data["children"].append(
+                self._element_to_dict(child)
             )
 
         return data

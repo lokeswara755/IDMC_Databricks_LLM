@@ -1,1260 +1,2536 @@
 from parser.xmlreader import XMLReader
+
 from parser.repository_parser import RepositoryParser
+
 from parser.graph_builder import GraphBuilder
-from pyspark.sql import functions as F
+from parser.MappingTaskParser import MappingTaskParser
+from parser.Taskflow_parser import TaskflowParser
+from parser.RuntimeParameterParser import RuntimeParameterParser
+from parser.DataQualityRuleParser import DataQualityRuleParser
+from parser.DataIngestionJobParser import DataIngestionJobParser
+from parser.ApplicationIntegrationProcessParser import ApplicationIntegrationProcessParser
+from parser.APIParser import APIParser
+from parser.AssetFolderParser import AssetFolderParser
+from parser.AIRecommendationParser import AIRecommendationParser
+from parser.RepositoryMetadataParser import RepositoryMetadataParser
+from parser.MetadataRelationshipParser import MetadataRelationshipParser
+from parser.CrossReferenceValidator import CrossReferenceValidator
 
-from Generator.IR_Generator import IRGenerator
-from Generator.PySpark_Generator import PySparkGenerator
+from LLM.Input_builder import LLMInputBuilder
 
-from Validator.IR_Validator import IRValidator
-from Validator.PySpark_Validator import PySparkValidator
-from parser.Datavalidator import DataValidator
+from LLM.LLMGenerator import LLMGenerator
+
+from LLM.LLM_PySpark_Validator import LLMPySparkValidator
+
+from Data_Validation.DataValidator import DataValidator
+
+from Human_GateWay.human_gateway import HumanGateway, PASS, REVIEW_REQUIRED, REWORK
 
 import os
+
 import re
+
+import json
+import traceback
+import inspect
+
+
+from datetime import date, datetime
+from decimal import Decimal
+from dataclasses import asdict, is_dataclass
+
+
+def make_json_serializable(obj):
+    """Convert parsed IDMC metadata into values supported by json.dump."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if is_dataclass(obj):
+        return make_json_serializable(asdict(obj))
+    if isinstance(obj, dict):
+        return {
+            str(key): make_json_serializable(value)
+            for key, value in obj.items()
+        }
+    if isinstance(obj, (list, tuple, set)):
+        values = list(obj)
+        if isinstance(obj, set):
+            values = sorted(values, key=repr)
+        return [make_json_serializable(value) for value in values]
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return make_json_serializable(obj.to_dict())
+    if hasattr(obj, "__dict__"):
+        return make_json_serializable(vars(obj))
+    return str(obj)
+
+
+
+from datetime import date, datetime
+from decimal import Decimal
+from dataclasses import asdict, is_dataclass
+
+
+def make_json_serializable(obj):
+    """Convert parsed IDMC metadata into values supported by json.dump."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    if isinstance(obj, Decimal):
+        return str(obj)
+
+    if is_dataclass(obj):
+        return make_json_serializable(asdict(obj))
+
+    if isinstance(obj, dict):
+        return {
+            str(key): make_json_serializable(value)
+            for key, value in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple, set)):
+        values = list(obj)
+        if isinstance(obj, set):
+            values = sorted(values, key=repr)
+        return [make_json_serializable(value) for value in values]
+
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return make_json_serializable(obj.to_dict())
+
+    if hasattr(obj, "__dict__"):
+        return make_json_serializable(vars(obj))
+
+    # Keep the save operation from failing on unexpected parser-specific types.
+    return str(obj)
 
 
 class MigrationPipeline:
-    """
-    Orchestrates the complete IDMC -> Databricks migration flow.
 
-    The pipeline does not contain parsing, graph, IR, generation, or
-    validation logic itself. It only controls the order in which the
-    existing components are executed.
-    """
+    def __init__(
 
-    def __init__(self, xml_path, spark, output_dir="/Volumes/idmc_poc/bronze/idmc_files/generated_pyspark"):
-        self.xml_path = xml_path
-        self.spark = spark
-        self.output_dir = output_dir
-
-        # Existing POC components
-        self.xml_reader = XMLReader(xml_path)
-        self.repository_parser = RepositoryParser()
-        self.graph_builder = GraphBuilder()
-        self.ir_generator = IRGenerator()
-        self.ir_validator = IRValidator()
-        self.pyspark_generator = PySparkGenerator()
-        self.data_validator = DataValidator(spark)
-
-    @staticmethod
-    def print_section(title):
-        print("\n" + "=" * 70)
-        print(title)
-        print("=" * 70)
-
-    def run(self):
-        """
-        Run the complete migration process.
-        """
-
-        self.print_section("IDMC TO DATABRICKS MIGRATION POC")
-
-        # ------------------------------------------------------------
-        # 1. READ XML
-        # ------------------------------------------------------------
-        root = self.xml_reader.read()
-
-        print("XML Status :", "LOADED")
-        print("Root       :", root.tag)
-
-        # ------------------------------------------------------------
-        # 2. PARSE REPOSITORY
-        # ------------------------------------------------------------
-        self.print_section("REPOSITORY PARSER")
-
-        repository = self.repository_parser.parse(root)
-
-        print("Repository :", repository.get("name"))
-
-        folders = repository.get("folders", [])
-
-        print("Folders    :", len(folders))
-
-        # ------------------------------------------------------------
-        # 3. PARSER VALIDATION / METADATA SUMMARY
-        # ------------------------------------------------------------
-        self.print_section("PARSER VALIDATION")
-
-        self.print_repository_summary(folders)
-
-        # ------------------------------------------------------------
-        # 4. PROCESS FOLDERS AND MAPPINGS
-        # ------------------------------------------------------------
-        self.print_section("MAPPING PROCESSING")
-
-        for folder_index, folder in enumerate(folders):
-            self.process_folder(
-                folder_index=folder_index,
-                folder=folder,
-                repository=repository
-            )
-
-        self.print_section("MIGRATION PROCESSING COMPLETE")
-
-    def print_repository_summary(self, folders):
-        """
-        Print the parsed repository metadata.
-        This keeps main orchestration separate from display logic.
-        """
-
-        for folder_index, folder in enumerate(folders):
-
-            print(f"\nFOLDER [{folder_index}]")
-            print("-" * 70)
-
-            print("Name :", folder.get("name"))
-
-            # Connections
-            connections = folder.get("connections", [])
-
-            print("\nConnections :", len(connections))
-
-            for connection in connections:
-                print(
-                    f"  {connection.get('name')} "
-                    f"| type={connection.get('type')} "
-                    f"| subtype={connection.get('subtype')}"
-                )
-
-            # Sources
-            sources = folder.get("sources", [])
-
-            print("\nSources :", len(sources))
-
-            for source in sources:
-                print(
-                    f"  {source.get('name')} "
-                    f"| type={source.get('type')} "
-                    f"| connection={source.get('connection')} "
-                    f"| columns={len(source.get('columns', []))}"
-                )
-
-            # Targets
-            targets = folder.get("targets", [])
-
-            print("\nTargets :", len(targets))
-
-            for target in targets:
-                print(
-                    f"  {target.get('name')} "
-                    f"| type={target.get('type')} "
-                    f"| connection={target.get('connection')} "
-                    f"| catalog={target.get('catalog')} "
-                    f"| schema={target.get('schema')}"
-                )
-
-            # Mappings
-            mappings = folder.get("mappings", [])
-
-            print("\nMappings :", len(mappings))
-
-            for mapping in mappings:
-                print(
-                    f"  {mapping.get('name')} "
-                    f"| sources={len(mapping.get('source_instances', []))} "
-                    f"| transformations={len(mapping.get('transformations', []))} "
-                    f"| targets={len(mapping.get('target_instances', []))} "
-                    f"| links={len(mapping.get('links', []))}"
-                )
-
-            # Sessions
-            sessions = folder.get("sessions", [])
-
-            print("\nSessions :", len(sessions))
-
-            for session in sessions:
-                print(
-                    f"  {session.get('name')} "
-                    f"| mapping={session.get('mapping')}"
-                )
-
-    def process_folder(self, folder_index, folder, repository):
-        """
-        Process all mappings inside one repository folder.
-        """
-
-        folder_name = folder.get("name")
-
-        mappings = folder.get("mappings", [])
-
-        print("\n" + "#" * 70)
-        print(f"FOLDER [{folder_index}] : {folder_name}")
-        print("#" * 70)
-
-        for mapping_index, mapping in enumerate(mappings):
-            self.process_mapping(
-                folder_index=folder_index,
-                mapping_index=mapping_index,
-                folder=folder,
-                mapping=mapping,
-                repository=repository
-            )
-
-    def process_mapping(
         self,
-        folder_index,
-        mapping_index,
-        folder,
-        mapping,
-        repository
+
+        xml_path,
+
+        spark,
+
+        output_dir="/Volumes/idmc_poc/bronze/idmc_files/generated_pyspark",
+
+        workspace_url=None,
+
+        databricks_token=None,
+
+        llm_model="databricks-gpt-oss-120b",
+
+        selected_mapping_name=None,
+
+        csv_defaults=None,
+
+        source_overrides=None,
+        dry_run=True,
+        execution_approved=False,
+        allow_synthetic_merge_keys=False,
+        verbose=False,
+        human_review_dir=None,
+        approved_review_id=None,
     ):
-        """
-        Execute the migration flow for one IDMC mapping.
-        """
 
-        mapping_name = mapping.get("name")
+        self.xml_path = xml_path
 
-        print("\n" + "-" * 70)
-        print(
-            f"MAPPING [{mapping_index}] : {mapping_name}"
+        self.spark = spark
+
+        self.output_dir = output_dir
+        self.selected_mapping_name = selected_mapping_name
+        self.csv_defaults = dict(csv_defaults or {"header": "true", "inferSchema": "true"})
+        # Explicit source overrides only. Keys should match a source logical_name,
+        # name, or current physical_table; values must be approved table identifiers.
+        # Example: {"some_logical_source": "idmc_poc.bronze.some_table"}
+        self.source_overrides = dict(source_overrides or {})
+        # Safe by default: generation/validation only. Execution requires explicit approval.
+        self.dry_run = bool(dry_run)
+        self.execution_approved = bool(execution_approved)
+        self.allow_synthetic_merge_keys = bool(allow_synthetic_merge_keys)
+        self.verbose = bool(verbose)
+        self.human_review_dir = human_review_dir or os.path.join(
+            self.output_dir, "human_reviews"
         )
-        print("-" * 70)
+        self.human_gateway = HumanGateway(review_dir=self.human_review_dir)
+        self.approved_review_id = approved_review_id
 
-        self.print_mapping_details(mapping)
-
-        # ------------------------------------------------------------
-        # 4A. BUILD GRAPH
-        # ------------------------------------------------------------
-        graph = self.build_graph(mapping)
-
-        # ------------------------------------------------------------
-        # 4B. GENERATE IR
-        # ------------------------------------------------------------
-        ir = self.generate_ir(
-            repository=repository,
-            folder=folder,
-            mapping=mapping,
-            graph=graph
-        )
-
-        # ------------------------------------------------------------
-        # 4C. VALIDATE IR
-        # ------------------------------------------------------------
-        ir_validation_report = self.validate_ir(ir)
-
-        if ir_validation_report["status"] != "VALID":
-            print("\nSTOPPING MAPPING")
-            print("Reason: IR validation failed.")
-            return
-
-        # ------------------------------------------------------------
-        # 4D. GENERATE PYSPARK
-        # ------------------------------------------------------------
-        generated_code = self.generate_pyspark(ir)
-
-        # ------------------------------------------------------------
-        # 4E. VALIDATE PYSPARK
-        # ------------------------------------------------------------
-        validation_result = self.validate_pyspark(
-            ir=ir,
-            generated_code=generated_code
-        )
-
-        if not validation_result["valid"]:
-            print("\nExecution : SKIPPED")
-            print("Reason    : PySpark validation failed")
-            return
-
-        # ------------------------------------------------------------
-        # 4F. CREATE TARGET DELTA TABLES
-        # ------------------------------------------------------------
-        target_result = self.create_target_tables(
-            mapping_name=mapping_name,
-            ir=ir,
-            folder=folder
-        )
-
-        if not target_result["success"]:
-            print("\nExecution : SKIPPED")
-            print("Reason    : Target Delta table creation failed")
-            return
-
-        # ------------------------------------------------------------
-        # 4G. EXECUTE PYSPARK
-        # ------------------------------------------------------------
-        self.execute_pyspark(
-            mapping_name=mapping_name,
-            generated_code=generated_code
-        )
-
-        # ------------------------------------------------------------
-        # 4H. VALIDATE TARGET TABLES
-        # ------------------------------------------------------------
-        target_validation_result = self.validate_target_tables(
-            mapping_name=mapping_name,
-            ir=ir,
-            folder=folder
-        )
-
-        if not target_validation_result["success"]:
-            print("\nMigration : FAILED")
-            print("Reason    : Target Delta table validation failed")
-            return
-
-        # ------------------------------------------------------------
-        # 4I. DATA RECONCILIATION / S-3
-        # ------------------------------------------------------------
-        reconciliation_result = self.validate_migration_data(
-            mapping_name=mapping_name,
-            ir=ir,
-            folder=folder
-        )
-
-        if reconciliation_result["overall_status"] != "PASS":
-            print("\nMigration : FAILED")
-            print("Reason    : Data reconciliation failed")
-            return
-
-        print("\nMigration : VALID")
-
-    def print_mapping_details(self, mapping):
-        """
-        Print source instances, transformations, targets and links.
-        """
-
-        print("\nMapping Details")
-
-        print(
-            "  Sources          :",
-            len(mapping.get("source_instances", []))
-        )
-
-        print(
-            "  Transformations  :",
-            len(mapping.get("transformations", []))
-        )
-
-        print(
-            "  Targets          :",
-            len(mapping.get("target_instances", []))
-        )
-
-        print(
-            "  Links            :",
-            len(mapping.get("links", []))
-        )
-
-        print("\nSource Instances")
-
-        for source_instance in mapping.get("source_instances", []):
-            print(
-                "  ",
-                source_instance.get("name"),
-                "→",
-                source_instance.get("source")
+        if not self.dry_run and not self.execution_approved:
+            raise ValueError(
+                "Execution blocked: set execution_approved=True only after reviewing "
+                "the generated code and approving target writes."
             )
 
-        print("\nTransformations")
+        if not workspace_url:
 
-        for transformation in mapping.get("transformations", []):
-            print(
-                "  ",
-                transformation.get("name"),
-                "| type=",
-                transformation.get("type")
+            raise ValueError(
+
+                "workspace_url is required."
+
             )
 
-        print("\nTarget Instances")
+        if not databricks_token:
 
-        for target_instance in mapping.get("target_instances", []):
-            print(
-                "  ",
-                target_instance.get("name"),
-                "→",
-                target_instance.get("target")
+            raise ValueError(
+
+                "databricks_token is required."
+
             )
 
-        print("\nLinks")
+        if not llm_model:
 
-        for link in mapping.get("links", []):
-            print(
-                "  ",
-                link.get("from"),
-                "→",
-                link.get("to")
+            raise ValueError(
+
+                "llm_model is required."
+
             )
 
-    def build_graph(self, mapping):
-        """
-        Build the generic execution graph from mapping metadata.
-        """
+        self.xml_reader = XMLReader(
 
-        mapping_name = mapping.get("name")
+            xml_path
 
-        self.print_section(
-            f"GRAPH : {mapping_name}"
         )
 
-        try:
-            graph = self.graph_builder.build(mapping)
-        except Exception as error:
-            print("GRAPH BUILD FAILED")
-            print("Error:", str(error))
-            raise
+        self.repository_parser = RepositoryParser()
 
-        print("\nGRAPH NODES")
+        self.metadata_bundle = {}
 
-        for node in graph.get("nodes", []):
-            print("  ", node)
+        self.graph_builder = GraphBuilder()
 
-        print("\nGRAPH EDGES")
+        self.llm_input_builder = LLMInputBuilder(csv_defaults=self.csv_defaults)
 
-        for edge in graph.get("edges", []):
-            print("  ", edge)
+        self.llm_generator = LLMGenerator(
 
-        print("\nEXECUTION ORDER")
+            workspace_url=workspace_url,
 
-        for index, node in enumerate(
-            graph.get("execution_order", []),
-            start=1
-        ):
-            print(f"  {index}. {node}")
+            databricks_token=databricks_token,
 
-        return graph
+            model=llm_model
 
-    def generate_ir(self, repository, folder, mapping, graph):
-        """
-        Convert parsed IDMC metadata and graph into canonical IR.
-        """
-
-        mapping_name = mapping.get("name")
-
-        self.print_section(
-            f"IR GENERATION : {mapping_name}"
         )
 
-        try:
-            ir = self.ir_generator.generate(
-                repository=repository,
-                folder=folder,
-                mapping=mapping,
-                graph=graph
-            )
-        except Exception as error:
-            print("IR GENERATION FAILED")
-            print("Error:", str(error))
-            raise
-
-        print("IR Mapping :", ir.get("name"))
-        print("IR Sources :", len(ir.get("sources", [])))
-        print(
-            "IR Transformations :",
-            len(ir.get("transformations", []))
-        )
-        print("IR Target :", ir.get("target"))
-
-        return ir
-
-    def validate_ir(self, ir):
-        """
-        Validate the canonical IR before generating PySpark.
-        """
-
-        mapping_name = ir.get("name")
-
-        self.print_section(
-            f"IR VALIDATION : {mapping_name}"
-        )
-
-        ir_validation_report = self.ir_validator.validate(ir)
-
-        print(
-            "Status   :",
-            ir_validation_report["status"]
-        )
-
-        print(
-            "Errors   :",
-            len(ir_validation_report["errors"])
-        )
-
-        print(
-            "Warnings :",
-            len(ir_validation_report["warnings"])
-        )
-
-        if ir_validation_report["errors"]:
-            print("\nIR ERRORS")
-
-            for error in ir_validation_report["errors"]:
-                print("  ERROR:", error)
-
-        if ir_validation_report["warnings"]:
-            print("\nIR WARNINGS")
-
-            for warning in ir_validation_report["warnings"]:
-                print("  WARNING:", warning)
-
-        return ir_validation_report
-
-    def generate_pyspark(self, ir):
-        """
-        Generate executable PySpark from the validated IR.
-        """
-
-        mapping_name = ir.get("name")
-
-        self.print_section(
-            f"PYSPARK GENERATION : {mapping_name}"
-        )
-
-        try:
-            generated_code = self.pyspark_generator.generate(ir)
-        except Exception as error:
-            print("PYSPARK GENERATION FAILED")
-            print("Error:", str(error))
-            raise
-
-        print("Status : GENERATED")
-
-        self.save_generated_pyspark(
+    def _human_review_result(
+        self, mapping_name, category, message, *, validations_passed=True,
+        evidence=None, scope="MAPPING", live_execution=None
+    ):
+        """Create a persisted Human Gateway item and return a pipeline result."""
+        review = self.human_gateway.create_review_item(
             mapping_name=mapping_name,
-            generated_code=generated_code
+            category=category,
+            message=str(message),
+            severity="BLOCKER",
+            evidence=evidence,
+            validations_passed=validations_passed,
+            live_execution=(not self.dry_run if live_execution is None else live_execution),
+            scope=scope,
         )
-
-        return generated_code
-
-    def _safe_filename(self, name):
-        """
-        Convert a mapping name into a safe Python filename.
-        """
-
-        value = str(name or "migration")
-        value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
-        value = value.strip("._")
-
-        return value or "migration"
-
-    def save_generated_pyspark(self, mapping_name, generated_code):
-        """
-        Persist generated PySpark as a real .py migration artifact.
-
-        This is intentionally separate from execution so the generated
-        implementation can be reviewed, versioned, deployed, or executed
-        independently after migration.
-        """
-
-        safe_name = self._safe_filename(mapping_name)
-        output_directory = self.output_dir
-        output_file = os.path.join(
-            output_directory,
-            f"{safe_name}.py"
-        )
-
-        try:
-            os.makedirs(output_directory, exist_ok=True)
-
-            with open(
-                output_file,
-                "w",
-                encoding="utf-8"
-            ) as file_handle:
-                file_handle.write(generated_code.rstrip() + "\n")
-
-        except Exception as error:
-            print("PYSPARK ARTIFACT SAVE FAILED")
-            print("Error:", str(error))
-            raise
-
-        print("Generated PySpark :", output_file)
-
-        return output_file
-
-    def validate_pyspark(self, ir, generated_code):
-        """
-        Validate generated PySpark before execution.
-        """
-
-        mapping_name = ir.get("name")
-
-        self.print_section(
-            f"PYSPARK VALIDATION : {mapping_name}"
-        )
-
-        execution_plan = {
-            "steps": [
-                {
-                    "name": name
-                }
-                for name in ir.get("execution_order", [])
-            ]
+        return {
+            "success": False,
+            "mapping_name": mapping_name,
+            "stage": "HUMAN_REVIEW" if review["status"] == REVIEW_REQUIRED else "HUMAN_REWORK",
+            "human_review": review,
+            "review_id": review["review_id"],
+            "error": str(message),
+            "dry_run": self.dry_run,
+            "executed": False,
         }
 
-        pyspark_validator = PySparkValidator(
-            ir,
-            execution_plan,
-            generated_code
+    def record_human_decision(self, review_id, decision, reviewer, comment=""):
+        """Record a reviewer decision against a persisted review ID."""
+        return self.human_gateway.record_decision_by_id(
+            review_id=review_id, decision=decision, reviewer=reviewer, comment=comment
         )
 
-        validation_result = pyspark_validator.validate()
-
-        print(
-            "Status :",
-            "VALID"
-            if validation_result["valid"]
-            else "INVALID"
+    def _approved_review_matches(self, mapping_name, category):
+        """Check an explicitly supplied approved review; never infer approval."""
+        if not self.approved_review_id:
+            return False
+        review = self.human_gateway.get_review(self.approved_review_id)
+        if review.get("mapping_name") != mapping_name:
+            return False
+        reviewed_categories = {
+            str(i.get("category", "")).upper() for i in review.get("issues", [])
+        }
+        reviewed_categories.update(
+            str(x).upper() for x in review.get("resolved_categories", [])
+        )
+        if category.upper() not in reviewed_categories:
+            return False
+        return self.human_gateway.can_proceed(
+            review, execution_approved=self.execution_approved
         )
 
-        print(
-            "Errors :",
-            len(validation_result["errors"])
+    def parse_specialized_metadata(self, root, repository):
+        """Parse additional IDMC assets and validate cross-references."""
+        print("\nParsing specialized IDMC metadata...")
+
+        metadata_bundle = {
+            "repository": repository,
+            "mapping_tasks": MappingTaskParser().parse(root),
+            "taskflows": TaskflowParser().parse(root),
+            "runtime_parameters": RuntimeParameterParser().parse(root),
+            "data_quality_rules": DataQualityRuleParser().parse(root),
+            "data_ingestion_jobs": DataIngestionJobParser().parse(root),
+            "application_integration_processes": ApplicationIntegrationProcessParser().parse(root),
+            "apis": APIParser().parse(root),
+            "asset_folders": AssetFolderParser().parse(root),
+            "ai_recommendations": AIRecommendationParser().parse(root),
+            "repository_metadata": RepositoryMetadataParser().parse(root),
+            "metadata_relationships": MetadataRelationshipParser().parse(root),
+        }
+
+        print("\nValidating cross-references...")
+        validation_result = CrossReferenceValidator().validate(root)
+        metadata_bundle["cross_reference_validation"] = validation_result
+
+        for asset_name, result in metadata_bundle.items():
+            if asset_name == "repository":
+                continue
+            if isinstance(result, dict) and "summary" in result:
+                print(f"{asset_name}: {result['summary']}")
+
+        print("\nCross-reference validation summary:")
+        summary = (
+            validation_result.get("summary", validation_result)
+            if isinstance(validation_result, dict)
+            else validation_result
         )
+        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
 
-        print(
-            "Warnings :",
-            len(validation_result["warnings"])
-        )
-
-        if validation_result["errors"]:
-            print("\nPYSPARK ERRORS")
-
-            for error in validation_result["errors"]:
-                print("  ERROR:", error)
-
-        if validation_result["warnings"]:
-            print("\nPYSPARK WARNINGS")
-
-            for warning in validation_result["warnings"]:
-                print("  WARNING:", warning)
-
-        return validation_result
-
+        self.metadata_bundle = metadata_bundle
+        return metadata_bundle
 
     # ============================================================
-    # TARGET DELTA TABLE CREATION
+
+    # MAIN PIPELINE
+
     # ============================================================
 
-    def create_target_tables(self, mapping_name, ir, folder):
-        """
-        Create Databricks Delta target tables from IDMC target metadata.
+    def run(self):
 
-        The target name, catalog, schema and column definitions are derived
-        from the parsed repository metadata / IR. Nothing is hardcoded for
-        CUSTOMER_ORDER_SUMMARY.
         """
 
-        self.print_section(
-            f"TARGET DELTA TABLE CREATION : {mapping_name}"
-        )
+        Run the complete LLM migration pipeline.
+
+        """
+
+        print("\n" + "=" * 60)
+
+        print("IDMC TO DATABRICKS - LLM MIGRATION")
+
+        print("=" * 60)
+        print(f"Execution mode: {'DRY RUN (no generated PySpark execution)' if self.dry_run else 'LIVE EXECUTION (generated PySpark may write to targets)'}")
 
         try:
-            ir_targets = ir.get("target", [])
 
-            if isinstance(ir_targets, dict):
-                ir_targets = [ir_targets]
+            # ----------------------------------------------------
 
-            if not ir_targets:
-                raise ValueError("No targets found in IR")
+            # 1. READ XML
 
-            repository_targets = folder.get("targets", [])
+            # ----------------------------------------------------
 
-            if not isinstance(repository_targets, list):
-                repository_targets = []
+            print("\n[1/5] Reading IDMC XML...")
 
-            created_tables = []
+            try:
+                root = self.xml_reader.read()
+            except Exception as xml_error:
+                review_result = self._human_review_result(
+                    mapping_name="XML_IMPORT",
+                    category="CORRUPTED_XML",
+                    message=f"Unable to read or parse the IDMC XML: {xml_error}",
+                    validations_passed=False,
+                    evidence={"xml_path": str(self.xml_path), "exception_type": type(xml_error).__name__},
+                    scope="REPOSITORY",
+                    live_execution=False,
+                )
+                print("XML parsing failed; Human Gateway review record created:", review_result["review_id"])
+                raise RuntimeError(
+                    f"IDMC XML could not be parsed. Human review: {review_result['review_id']}"
+                ) from xml_error
 
-            ddl_artifacts = []
+            print(
 
-            for ir_target in ir_targets:
-                if not isinstance(ir_target, dict):
-                    raise ValueError(
-                        f"Invalid target metadata for mapping '{mapping_name}'"
-                    )
+                f"      XML loaded successfully "
 
-                target_name = (
-                    ir_target.get("target")
-                    or ir_target.get("name")
+                f"(root={root.tag})"
+
+            )
+
+            # ----------------------------------------------------
+
+            # 2. PARSE REPOSITORY
+
+            # ----------------------------------------------------
+
+            print("\n[2/5] Parsing IDMC repository...")
+
+            repository = self.repository_parser.parse(
+
+                root
+
+            )
+
+            folders = repository.get(
+
+                "folders",
+
+                []
+
+            )
+
+            print(
+
+                f"      Repository : "
+
+                f"{repository.get('name')}"
+
+            )
+
+            print(
+
+                f"      Folders    : "
+
+                f"{len(folders)}"
+
+            )
+
+            # ----------------------------------------------------
+            # 2.1 PARSE SPECIALIZED METADATA
+            # ----------------------------------------------------
+
+            print("\n[2.1/5] Parsing specialized metadata...")
+            metadata_bundle = self.parse_specialized_metadata(
+                root=root,
+                repository=repository
+            )
+            print("Specialized metadata parsing completed.")
+
+            # ----------------------------------------------------
+            # 2.2 SAVE AND PRINT PARSED IDMC METADATA (BEFORE LLM)
+            # ----------------------------------------------------
+            print("\n[2.2/5] Saving parsed IDMC metadata...")
+
+            parsed_objects = make_json_serializable(metadata_bundle)
+            parsed_dir = "/Volumes/idmc_poc/bronze/idmc_files/parsed_metadata"
+            os.makedirs(parsed_dir, exist_ok=True)
+
+            parsed_path = os.path.join(
+                parsed_dir,
+                "idmc_parsed_objects.json"
+            )
+
+            with open(parsed_path, "w", encoding="utf-8") as parsed_file:
+                json.dump(
+                    parsed_objects,
+                    parsed_file,
+                    indent=2,
+                    ensure_ascii=False
                 )
 
-                if not target_name:
-                    raise ValueError("Target name is missing from IR")
+            print(f"Saved parsed metadata: {parsed_path}")
+            print("\nParsed object summary:")
+            for object_name, object_value in parsed_objects.items():
+                if isinstance(object_value, (dict, list)):
+                    print(f"  {object_name}: {len(object_value)} items/keys")
+                else:
+                    print(f"  {object_name}: {type(object_value).__name__}")
 
-                # Match the logical target from the IR to the repository
-                # target definition, where the actual columns/catalog/schema
-                # are normally available.
-                repository_target = None
+            print("\nParsed metadata preview (first 12,000 characters):")
+            print(
+                json.dumps(parsed_objects, indent=2, ensure_ascii=False)[:12000]
+            )
 
-                for candidate in repository_targets:
-                    if not isinstance(candidate, dict):
+
+            # ----------------------------------------------------
+
+            # 3. PROCESS MAPPINGS
+
+            # ----------------------------------------------------
+
+            print("\n[3/5] Processing mappings...")
+
+            migration_results = []
+            selected_mapping_name = self.selected_mapping_name
+            selected_mapping_found = False
+            processed_mapping_count = 0
+
+            if selected_mapping_name:
+                print(f"Running only selected mapping: {selected_mapping_name}")
+            else:
+                print("No mapping filter configured; processing all mappings found in the repository.")
+
+            for folder in folders:
+
+                folder_name = folder.get(
+
+                    "name",
+
+                    "Unknown"
+
+                )
+
+                mappings = folder.get(
+
+                    "mappings",
+
+                    []
+
+                )
+
+                print(
+
+                    f"\n      Folder: {folder_name}"
+
+                )
+
+                for mapping in mappings:
+                    mapping_name = (
+                        mapping.get("name")
+                        or mapping.get("mapping_name")
+                    )
+
+                    # If a specific mapping was requested, process only that one.
+                    # If selected_mapping_name is None/empty, process every mapping.
+                    if selected_mapping_name and mapping_name != selected_mapping_name:
+                        print(f"Skipping mapping (not selected): {mapping_name}")
                         continue
 
-                    candidate_name = candidate.get("name")
+                    selected_mapping_found = True
+                    processed_mapping_count += 1
+                    if selected_mapping_name:
+                        print(f"Running selected mapping: {mapping_name}")
+                    else:
+                        print(f"Running mapping: {mapping_name}")
 
-                    if candidate_name == target_name:
-                        repository_target = candidate
-                        break
+                    result = self.process_mapping(mapping)
+                    migration_results.append(result)
 
-                # Some IRs use a target-instance name while the repository
-                # metadata uses the physical target name. Try both forms.
-                if repository_target is None:
-                    ir_target_name = ir_target.get("name")
-
-                    for candidate in repository_targets:
-                        if not isinstance(candidate, dict):
-                            continue
-
-                        if candidate.get("name") == ir_target_name:
-                            repository_target = candidate
-                            break
-
-                metadata = repository_target or ir_target
-
-                catalog = (
-                    metadata.get("catalog")
-                    or ir_target.get("catalog")
-                    or "idmc_poc"
+            if selected_mapping_name and not selected_mapping_found:
+                raise ValueError(
+                    f"Selected mapping '{selected_mapping_name}' was not found "
+                    "in the parsed repository. Check the mapping name returned "
+                    "by RepositoryParser."
                 )
 
-                schema = (
-                    metadata.get("schema")
-                    or ir_target.get("schema")
-                    or "silver"
+            if not selected_mapping_name and processed_mapping_count == 0:
+                raise ValueError(
+                    "No mappings were found in the parsed repository. "
+                    "Check RepositoryParser output and the input XML."
                 )
 
-                table_name = (
-                    metadata.get("name")
-                    or target_name
-                )
+            # ----------------------------------------------------
 
-                columns = metadata.get("columns", [])
+            # 4. FINAL SUMMARY
 
-                # If repository target columns are unavailable, fall back to
-                # target ports in the IR.
-                if not columns:
-                    columns = ir_target.get("ports", [])
+            # ----------------------------------------------------
 
-                if not columns:
-                    raise ValueError(
-                        f"No target columns found for '{table_name}'"
-                    )
+            print(
 
-                ddl_columns = []
+                "\n[4/5] Migration summary..."
 
-                for column in columns:
-                    if not isinstance(column, dict):
-                        continue
+            )
 
-                    column_name = (
-                        column.get("name")
-                        or column.get("column")
-                    )
+            self.print_final_summary(
 
-                    if not column_name:
-                        continue
+                migration_results
 
-                    datatype = (
-                        column.get("datatype")
-                        or column.get("type")
-                        or "STRING"
-                    )
+            )
 
-                    spark_type = self._map_idmc_datatype_to_spark(
-                        datatype=datatype,
-                        precision=column.get("precision"),
-                        scale=column.get("scale"),
-                        length=column.get("length")
-                    )
+            # ----------------------------------------------------
 
-                    ddl_columns.append(
-                        f"`{column_name}` {spark_type}"
-                    )
+            # 5. COMPLETE
 
-                if not ddl_columns:
-                    raise ValueError(
-                        f"No valid target columns found for '{table_name}'"
-                    )
+            # ----------------------------------------------------
 
-                full_table_name = (
-                    f"{catalog}.{schema}.{table_name}"
-                )
+            print(
 
-                ddl = (
-                    f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema};\n\n"
-                    f"CREATE TABLE IF NOT EXISTS {full_table_name} (\n"
-                    + ",\n".join(
-                        f"    {column}"
-                        for column in ddl_columns
-                    )
-                    + "\n) USING DELTA;"
-                )
+                "\n[5/5] Migration completed."
 
-                print("\nTarget :", full_table_name)
-                print("Columns:", len(ddl_columns))
-                print("DDL    :")
-                print(ddl)
+            )
 
-                # Execute statements separately because Spark SQL execution
-                # of multi-statement strings is environment-dependent.
-                self.spark.sql(
-                    f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"
-                )
-
-                self.spark.sql(
-                    f"CREATE TABLE IF NOT EXISTS {full_table_name} ("
-                    + ", ".join(ddl_columns)
-                    + ") USING DELTA"
-                )
-
-                ddl_artifact = self.save_target_ddl(
-                    mapping_name=mapping_name,
-                    table_name=table_name,
-                    ddl=ddl
-                )
-
-                created_tables.append(full_table_name)
-                ddl_artifacts.append(ddl_artifact)
-
-                print("Status : CREATED / EXISTS")
-                print("DDL Artifact:", ddl_artifact)
-
-            return {
-                "success": True,
-                "tables": created_tables,
-                "ddl_artifacts": ddl_artifacts
-            }
+            # Full LLM responses remain in JSON files; return only compact status rows.
+            return [self._compact_result(result) for result in migration_results]
 
         except Exception as error:
-            print("Target Delta table creation : FAILED")
-            print("Error:", str(error))
+
+            print(
+
+                "\nMigration pipeline failed:"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+            print("\nFull traceback:")
+            traceback.print_exc()
+
+            raise
+
+    # ============================================================
+
+    # PROCESS MAPPING
+
+    # ============================================================
+
+    def process_mapping(
+
+        self,
+
+        mapping
+
+    ):
+
+        """
+
+        Process one IDMC mapping through the complete
+
+        LLM migration flow.
+
+        """
+
+        mapping_name = mapping.get(
+
+            "name",
+
+            "unknown_mapping"
+
+        )
+
+        print("\n" + "-" * 60)
+
+        print(
+
+            f"Mapping: {mapping_name}"
+
+        )
+
+        print("-" * 60)
+
+        # --------------------------------------------------------
+
+        # 1. BUILD GRAPH
+
+        # --------------------------------------------------------
+
+        try:
+
+            graph = self.graph_builder.build(
+
+                mapping
+
+            )
+
+            print(
+
+                f"Graph built "
+
+                f"({len(graph.get('nodes', []))} nodes, "
+
+                f"{len(graph.get('edges', []))} edges)"
+
+            )
+
+        except Exception as error:
+
+            print(
+
+                "Graph build: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+            error_traceback = traceback.format_exc()
+            print("\nFull traceback:")
+            print(error_traceback)
+
+            return self._human_review_result(
+                mapping_name, "GRAPH_BUILD_FAILED", str(error),
+                validations_passed=False, evidence={"traceback": error_traceback}
+            )
+
+        # --------------------------------------------------------
+
+        # 2. BUILD LLM INPUT
+
+        # --------------------------------------------------------
+
+        try:
+            if self.verbose:
+                print(f"Building LLM input for {mapping_name} from {self.xml_path}")
+
+            llm_input = self.llm_input_builder.build(
+                mapping=mapping,
+                graph=graph,
+                xml_path=self.xml_path,
+                specialized_metadata=self.metadata_bundle,
+            )
+
+            if self.verbose:
+                print("LLM input built.")
+
+            # Validate/resolve source tables BEFORE calling the LLM. This prevents
+            # predictable TABLE_OR_VIEW_NOT_FOUND and missing-column failures.
+            source_preflight = self._preflight_sources(llm_input)
+            print(
+                f"Source preflight: {'PASS' if source_preflight.get('ready') else 'BLOCKED'} "
+                f"({len(source_preflight.get('checked_sources', []))} source(s), "
+                f"{len(source_preflight.get('blocking_issues', []))} blocker(s))"
+            )
+            if self.verbose and source_preflight.get("blocking_issues"):
+                for issue in source_preflight["blocking_issues"]:
+                    print(f"  - {issue}")
+
+            if not source_preflight.get("ready", False):
+                review_result = self._human_review_result(
+                    mapping_name, "SOURCE_PREFLIGHT_FAILED",
+                    "Required source resolution/schema checks failed; LLM generation was skipped.",
+                    validations_passed=False,
+                    evidence={"blocking_issues": source_preflight.get("blocking_issues", [])},
+                )
+                review_result["source_preflight"] = source_preflight
+                review_result["blocking_issues"] = source_preflight.get("blocking_issues", [])
+                return review_result
+
+            if self.verbose:
+                print("Enriching target metadata from the catalog...")
+            self._enrich_target_metadata_from_catalog(llm_input)
+
+            if self.verbose:
+                print("Target metadata enrichment complete.")
+            self.print_llm_input_summary(
+                mapping_name,
+                llm_input,
+            )
+
+            # ----------------------------------------------------
+
+            # DEBUG: PRINT COMPLETE TARGET METADATA
+
+            # ----------------------------------------------------
+            if self.verbose:
+                print("Target metadata:")
+                print(json.dumps(llm_input.get("targets", []), indent=2, ensure_ascii=False, default=str))
+
+        except Exception as error:
+            print("[ERROR] LLM input stage failed:", repr(error))
+            traceback.print_exc()
 
             return {
                 "success": False,
-                "tables": [],
-                "ddl_artifacts": [],
-                "error": str(error)
+                "mapping_name": mapping_name,
+                "stage": "LLM_INPUT_BUILD",
+                "error": repr(error),
+                "traceback": traceback.format_exc(),
             }
 
-    @staticmethod
-    def _map_idmc_datatype_to_spark(
-        datatype,
-        precision=None,
-        scale=None,
-        length=None
-    ):
-        """Map common IDMC datatypes to Databricks/Spark SQL types."""
+        # --------------------------------------------------------
 
-        normalized = str(datatype).strip().upper()
+        # 3. GENERATE PYSPARK WITH LLM
 
-        datatype_map = {
-            "INTEGER": "INT",
-            "INT": "INT",
-            "BIGINT": "BIGINT",
-            "SMALLINT": "SMALLINT",
-            "TINYINT": "TINYINT",
-            "FLOAT": "FLOAT",
-            "DOUBLE": "DOUBLE",
-            "REAL": "DOUBLE",
-            "DECIMAL": "DECIMAL",
-            "NUMERIC": "DECIMAL",
-            "VARCHAR": "STRING",
-            "CHAR": "STRING",
-            "STRING": "STRING",
-            "TEXT": "STRING",
-            "CLOB": "STRING",
-            "BOOLEAN": "BOOLEAN",
-            "BOOL": "BOOLEAN",
-            "DATE": "DATE",
-            "DATETIME": "TIMESTAMP",
-            "TIMESTAMP": "TIMESTAMP",
-            "TIMESTAMP_NTZ": "TIMESTAMP_NTZ",
-            "TIME": "STRING",
-            "BINARY": "BINARY"
-        }
-
-        if normalized in {"DECIMAL", "NUMERIC"}:
-            try:
-                p = int(precision) if precision is not None else 18
-            except (TypeError, ValueError):
-                p = 18
-
-            try:
-                s = int(scale) if scale is not None else 2
-            except (TypeError, ValueError):
-                s = 2
-
-            return f"DECIMAL({p},{s})"
-
-        if normalized in datatype_map:
-            return datatype_map[normalized]
-
-        # Preserve already-valid Spark SQL type strings when possible.
-        if normalized.startswith("DECIMAL("):
-            return normalized
-
-        # Conservative fallback for unsupported IDMC string-like types.
-        return "STRING"
-
-    def save_target_ddl(self, mapping_name, table_name, ddl):
-        """Persist generated target DDL as a physical SQL artifact."""
-
-        output_directory = os.path.join(
-            self.output_dir,
-            "ddl"
-        )
+        # --------------------------------------------------------
 
         try:
-            os.makedirs(output_directory, exist_ok=True)
-        except Exception:
-            pass
+
+            print(
+
+                "\nLLM generation: RUNNING..."
+
+            )
+
+            # Let the LLM repair validation failures before the pipeline saves
+            # the final generated PySpark. The validator is never bypassed.
+            llm_result = self.llm_generator.generate(
+                llm_input,
+                validator_factory=lambda code, metadata: LLMPySparkValidator(
+                    generated_code=code,
+                    llm_input=metadata,
+                    spark=self.spark,
+                ),
+                max_repair_attempts=3,
+            )
+
+            if llm_result.get("generation_status") != "VALIDATED":
+                print("LLM generation: NOT VALIDATED; final execution gate will remain blocked.")
+                print("Generation status:", llm_result.get("generation_status"))
+                print("Final generator validation:", llm_result.get("validation", {}))
+                print("Validation history:", llm_result.get("validation_history", []))
+            else:
+                print("LLM generation: repair-loop validation passed; independent final validation is still required.")
+
+        except Exception as error:
+
+            print(
+
+                "LLM generation: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+            error_traceback = traceback.format_exc()
+            print("\nFull traceback:")
+            print(error_traceback)
+
+            return self._human_review_result(
+                mapping_name, "LLM_GENERATION_FAILED", str(error),
+                validations_passed=False, evidence={"traceback": error_traceback}
+            )
+
+        # --------------------------------------------------------
+
+        # 4. SAVE LLM RESULT
+
+        # --------------------------------------------------------
+
+        try:
+
+            llm_result_path = (
+
+                self.save_llm_result(
+
+                    mapping_name,
+
+                    llm_result
+
+                )
+
+            )
+
+            print(
+
+                f"LLM result saved: "
+
+                f"{llm_result_path}"
+
+            )
+
+        except Exception as error:
+
+            print(
+
+                "LLM result save: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+
+            return {
+
+                "success": False,
+
+                "mapping_name": mapping_name,
+
+                "stage": "SAVE_LLM_RESULT",
+
+                "error": str(error)
+
+            }
+
+        # --------------------------------------------------------
+
+        # 5. EXTRACT GENERATED PYSPARK
+
+        # --------------------------------------------------------
+
+        generated_code = llm_result.get(
+
+            "pyspark_code",
+
+            ""
+
+        )
+
+        if not generated_code.strip():
+
+            error_message = (
+
+                "LLM generated empty PySpark code."
+
+            )
+
+            print(
+
+                f"PySpark generation: FAILED - "
+
+                f"{error_message}"
+
+            )
+
+            return {
+
+                "success": False,
+
+                "mapping_name": mapping_name,
+
+                "stage": "PYSPARK_GENERATION",
+
+                "llm_result": llm_result,
+
+                "llm_result_path": llm_result_path,
+
+                "error": error_message
+
+            }
+
+        print(
+            "PySpark artifact generated; validation is still required before it can be considered ready."
+        )
+
+        # --------------------------------------------------------
+
+        # 6. SAVE GENERATED PYSPARK
+
+        # --------------------------------------------------------
+
+        try:
+
+            pyspark_path = (
+
+                self.save_generated_pyspark(
+
+                    mapping_name,
+
+                    generated_code
+
+                )
+
+            )
+
+            print(
+
+                f"PySpark saved: "
+
+                f"{pyspark_path}"
+
+            )
+
+        except Exception as error:
+
+            print(
+
+                "PySpark save: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+
+            return {
+
+                "success": False,
+
+                "mapping_name": mapping_name,
+
+                "stage": "SAVE_PYSPARK",
+
+                "llm_result": llm_result,
+
+                "llm_result_path": llm_result_path,
+
+                "error": str(error)
+
+            }
+
+        # --------------------------------------------------------
+
+        # 7. VALIDATE GENERATED PYSPARK
+
+        # --------------------------------------------------------
+
+        validation_result = (
+
+            self.validate_llm_pyspark(
+
+                mapping_name=mapping_name,
+
+                llm_input=llm_input,
+
+                generated_code=generated_code,
+
+                spark=self.spark
+
+            )
+
+        )
+
+        # Fail closed across both gates. The generator's repair-loop validation
+        # includes mapping-aware semantic checks; the standalone final validator
+        # must not erase those errors merely because its own checks pass.
+        generation_status = llm_result.get("generation_status")
+        generation_validation = llm_result.get("validation", {}) or {}
+        generation_errors = generation_validation.get("errors", []) or []
+        generation_gate_passed = (
+            generation_status == "VALIDATED"
+            and bool(generation_validation.get("valid"))
+            and not generation_errors
+        )
+        if not generation_gate_passed:
+            validation_result = dict(validation_result)
+            combined_errors = list(validation_result.get("errors", []) or [])
+            if not generation_errors:
+                generation_errors = [
+                    f"Generator validation did not pass (generation_status={generation_status!r})."
+                ]
+            for error in generation_errors:
+                message = "Generator validation: " + str(error)
+                if message not in combined_errors:
+                    combined_errors.append(message)
+            validation_result["errors"] = combined_errors
+            validation_result["valid"] = False
+            validation_result.setdefault("warnings", [])
+
+        if not validation_result.get(
+
+            "valid",
+
+            False
+
+        ):
+
+            print(
+
+                "PySpark validation: FAILED"
+
+            )
+
+            print(
+
+                "Execution skipped."
+
+            )
+
+            review_result = self._human_review_result(
+                mapping_name, "PYSPARK_VALIDATION_FAILED",
+                "Generated PySpark failed mandatory validation; execution is blocked.",
+                validations_passed=False, evidence=validation_result,
+            )
+            review_result.update({
+                "llm_result": llm_result,
+                "llm_result_path": llm_result_path,
+                "validation": validation_result,
+                "generated_pyspark": pyspark_path,
+            })
+            return review_result
+
+        print(
+
+            "PySpark validation: VALID"
+
+        )
+
+        # --------------------------------------------------------
+        # 7. HUMAN GATEWAY: inspect synthetic merge keys AFTER
+        # mandatory PySpark validation, but BEFORE the dry-run exit.
+        # --------------------------------------------------------
+
+        targets = llm_input.get("targets", []) or []
+        synthetic_targets = []
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+
+            attributes = target.get("attributes", {}) or {}
+            key_status = (
+                target.get("merge_key_status")
+                or attributes.get("merge_key_status")
+            )
+
+            if str(key_status or "").upper() == "SYNTHETIC_POC":
+                synthetic_targets.append(
+                    target.get("physical_table")
+                    or target.get("target")
+                    or target.get("name")
+                    or "unknown target"
+                )
+
+        if synthetic_targets:
+            message = (
+                "Target merge keys are marked SYNTHETIC_POC: "
+                + ", ".join(map(str, synthetic_targets))
+                + ". A reviewer must confirm their use for this POC."
+            )
+
+            approved = self._approved_review_matches(
+                mapping_name, "UNVERIFIED_MERGE_KEY"
+            )
+
+            if not approved:
+                review_result = self._human_review_result(
+                    mapping_name,
+                    "UNVERIFIED_MERGE_KEY",
+                    message,
+                    validations_passed=True,
+                    evidence={"synthetic_targets": synthetic_targets},
+                    live_execution=not self.dry_run,
+                )
+
+                review_result.update({
+                    "validation": validation_result,
+                    "llm_result": llm_result,
+                    "llm_result_path": llm_result_path,
+                    "generated_pyspark": pyspark_path,
+                })
+
+                if self.dry_run:
+                    review_result["stage"] = "DRY_RUN_REVIEW_REQUIRED"
+
+                return review_result
+
+            # Human approval does not automatically authorize live execution.
+            if not self.dry_run and not self.allow_synthetic_merge_keys:
+                return {
+                    "success": False,
+                    "mapping_name": mapping_name,
+                    "stage": "EXECUTION_SAFETY_GATE",
+                    "dry_run": False,
+                    "executed": False,
+                    "error": (
+                        "Human review is approved, but execution remains blocked. "
+                        "Set allow_synthetic_merge_keys=True only for an "
+                        "explicitly approved POC run."
+                    ),
+                    "review_id": self.approved_review_id,
+                    "validation": validation_result,
+                }
+
+        # --------------------------------------------------------
+        # 7.1 SAFE DRY-RUN EXIT: never execute generated code in dry-run mode.
+        # --------------------------------------------------------
+
+        if self.dry_run:
+            print(
+                "DRY RUN: validation passed. Generated PySpark was NOT "
+                "executed; no target writes were initiated by this pipeline."
+            )
+            return {
+                "success": True,
+                "mapping_name": mapping_name,
+                "stage": "DRY_RUN_VALIDATION",
+                "dry_run": True,
+                "executed": False,
+                "validation": validation_result,
+                "llm_result": llm_result,
+                "llm_result_path": llm_result_path,
+                "generated_pyspark": pyspark_path,
+                "blocking_issues": llm_input.get("blocking_issues", []),
+            }
+
+        # 8. EXECUTE GENERATED PYSPARK
+
+        # --------------------------------------------------------
+
+        try:
+
+            print(
+
+                "PySpark execution: RUNNING..."
+
+            )
+
+            execution_result = self.execute_pyspark(mapping_name)
+
+            print(
+
+                "PySpark execution: SUCCESS"
+
+            )
+
+        except Exception as error:
+
+            error_traceback = traceback.format_exc()
+            print(
+
+                "PySpark execution: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+            print("\nFull traceback:")
+            print(error_traceback)
+
+            return {
+
+                "success": False,
+
+                "mapping_name": mapping_name,
+
+                "stage": "PYSPARK_EXECUTION",
+
+                "llm_result": llm_result,
+
+                "llm_result_path": llm_result_path,
+
+                "validation": validation_result,
+
+                "generated_pyspark": pyspark_path,
+
+                "error": str(error),
+                "traceback": error_traceback
+
+            }
+
+        # --------------------------------------------------------
+
+        # 9. GENERIC DATA VALIDATION
+
+        # --------------------------------------------------------
+
+        try:
+
+            print(
+
+                "\nData validation: RUNNING..."
+
+            )
+
+            data_validator = DataValidator(
+
+                spark=self.spark
+
+            )
+
+            data_validation_result = (
+
+                data_validator.validate(
+
+                    mapping=mapping,
+
+                    llm_input=llm_input,
+
+                    llm_result=llm_result
+
+                )
+
+            )
+
+            data_validator.print_report(
+
+                data_validation_result
+
+            )
+
+            if (
+
+                data_validation_result.get(
+
+                    "overall_status"
+
+                )
+
+                != "PASS"
+
+            ):
+
+                print(
+
+                    "Data validation: FAILED"
+
+                )
+
+                review_result = self._human_review_result(
+                    mapping_name, "DATA_VALIDATION_FAILED",
+                    "Post-execution data validation did not pass. Target writes may already have occurred; investigate and remediate.",
+                    validations_passed=False, evidence=data_validation_result,
+                )
+                review_result.update({
+                    "stage": "DATA_VALIDATION",
+                    "executed": True,
+                    "llm_result": llm_result,
+                    "llm_result_path": llm_result_path,
+                    "validation": validation_result,
+                    "data_validation": data_validation_result,
+                    "generated_pyspark": pyspark_path,
+                })
+                return review_result
+
+            print(
+
+                "Data validation: PASS"
+
+            )
+
+        except Exception as error:
+
+            error_traceback = traceback.format_exc()
+            print(
+
+                "Data validation: FAILED"
+
+            )
+
+            print(
+
+                f"Error: {error}"
+
+            )
+            print("\nFull traceback:")
+            print(error_traceback)
+
+            return {
+
+                "success": False,
+
+                "mapping_name": mapping_name,
+
+                "stage": "DATA_VALIDATION",
+
+                "llm_result": llm_result,
+
+                "llm_result_path": llm_result_path,
+
+                "validation": validation_result,
+
+                "generated_pyspark": pyspark_path,
+
+                "error": str(error),
+                "traceback": error_traceback
+
+            }
+
+        # --------------------------------------------------------
+
+        # 10. SUCCESS
+
+        # --------------------------------------------------------
+
+        print(
+
+            f"Mapping migration: SUCCESS - "
+
+            f"{mapping_name}"
+
+        )
+
+        return {
+            "success": True,
+            "mapping_name": mapping_name,
+            "stage": "COMPLETED",
+            "dry_run": False,
+            "executed": True,
+            "execution_result": str(execution_result)[:500] if execution_result is not None else None,
+            "llm_result": llm_result,
+
+            "llm_result_path": llm_result_path,
+
+            "validation": validation_result,
+
+            "generated_pyspark": pyspark_path
+
+        }
+
+    @staticmethod
+    def _source_column_names(columns):
+        """Extract declared source column names from common parser metadata shapes."""
+        names = []
+        if not isinstance(columns, list):
+            return names
+        for item in columns:
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = (
+                    item.get("name")
+                    or item.get("column_name")
+                    or item.get("field_name")
+                    or item.get("port_name")
+                    or item.get("column")
+                )
+            else:
+                name = None
+            if name and str(name).strip():
+                names.append(str(name).strip())
+        # Preserve order while removing duplicates case-insensitively.
+        result = []
+        seen = set()
+        for name in names:
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(name)
+        return result
+
+    def _preflight_sources(self, llm_input):
+        """Resolve explicitly configured source overrides and validate table schemas.
+
+        This method is read-only. It does not create tables, mutate data, infer
+        business equivalence, or substitute a source unless source_overrides was
+        explicitly supplied by the caller.
+        """
+        result = {
+            "ready": True,
+            "checked_sources": [],
+            "warnings": [],
+            "blocking_issues": [],
+            "applied_overrides": [],
+        }
+        if not isinstance(llm_input, dict):
+            result["ready"] = False
+            result["blocking_issues"].append("LLM input is not a dictionary; source preflight cannot run.")
+            return result
+
+        sources = llm_input.get("sources", [])
+        if not isinstance(sources, list):
+            result["ready"] = False
+            result["blocking_issues"].append("LLM input 'sources' is not a list.")
+            return result
+        if not sources:
+            result["ready"] = False
+            result["blocking_issues"].append("No sources were declared in the LLM input.")
+            return result
+
+        for index, source in enumerate(sources):
+            if not isinstance(source, dict):
+                result["blocking_issues"].append(f"Source at index {index} is not a metadata dictionary.")
+                continue
+
+            logical_name = source.get("logical_name") or source.get("source") or source.get("name") or source.get("object") or f"source_{index}"
+            original_physical = source.get("physical_table")
+            override = None
+            override_key = None
+            for candidate in (logical_name, source.get("name"), source.get("source"), original_physical):
+                if candidate is not None and str(candidate) in self.source_overrides:
+                    override = self.source_overrides[str(candidate)]
+                    override_key = str(candidate)
+                    break
+
+            if override is not None:
+                override = str(override).strip()
+                parts = override.split(".")
+                if len(parts) != 3 or any(not part.strip() for part in parts):
+                    result["blocking_issues"].append(
+                        f"Invalid source override for {logical_name!r}: {override!r}. "
+                        "Use a fully qualified catalog.schema.table identifier."
+                    )
+                    continue
+                source["physical_table"] = override
+                source["file_path"] = None
+                source["location_type"] = "table"
+                source["location_resolution"] = f"Explicit source override configured for {override_key}."
+                source["source_override_applied"] = True
+                result["applied_overrides"].append({
+                    "logical_name": logical_name,
+                    "from": original_physical,
+                    "to": override,
+                    "override_key": override_key,
+                })
+
+            location_type = str(source.get("location_type") or "unresolved").lower()
+            physical_table = source.get("physical_table")
+
+            if location_type == "table" or physical_table:
+                if not physical_table:
+                    result["blocking_issues"].append(
+                        f"Source {logical_name!r} is marked as a table but has no physical_table identifier."
+                    )
+                    continue
+                table_name = str(physical_table)
+                item = {
+                    "logical_name": logical_name,
+                    "location_type": "table",
+                    "physical_table": table_name,
+                    "status": "unchecked",
+                }
+                try:
+                    dataframe = self.spark.table(table_name)
+                    actual_columns = [field.name for field in dataframe.schema.fields]
+                    actual_by_casefold = {name.casefold(): name for name in actual_columns}
+                    item["status"] = "available"
+                    item["actual_columns"] = actual_columns
+                    source["catalog_lookup_status"] = "available"
+                    source["catalog_columns"] = actual_columns
+
+                    declared_columns = self._source_column_names(
+                        source.get("columns") or source.get("fields") or source.get("ports") or []
+                    )
+                    # Only compare when source metadata explicitly declares columns.
+                    if declared_columns:
+                        missing = [name for name in declared_columns if name.casefold() not in actual_by_casefold]
+                        item["declared_columns"] = declared_columns
+                        item["missing_declared_columns"] = missing
+                        if missing:
+                            item["status"] = "schema_mismatch"
+                            issue = (
+                                f"Source {logical_name!r} resolves to {table_name!r}, but declared columns "
+                                f"are missing from the catalog table: {missing}."
+                            )
+                            result["blocking_issues"].append(issue)
+                    source["source_preflight_status"] = item["status"]
+                except Exception as exc:
+                    item["status"] = "unavailable"
+                    item["error"] = str(exc)[:500]
+                    source["catalog_lookup_status"] = "unavailable"
+                    source["source_preflight_status"] = "unavailable"
+                    result["blocking_issues"].append(
+                        f"Source {logical_name!r} table {table_name!r} is unavailable: {str(exc)[:300]}"
+                    )
+                result["checked_sources"].append(item)
+                continue
+
+            if location_type == "file":
+                file_path = source.get("resolved_file_path") or source.get("file_path")
+                item = {
+                    "logical_name": logical_name,
+                    "location_type": "file",
+                    "file_path": file_path,
+                    "status": "unchecked",
+                }
+                if not file_path or not isinstance(file_path, str):
+                    item["status"] = "unavailable"
+                    item["error"] = "No resolved file_path was supplied in source metadata."
+                    result["blocking_issues"].append(
+                        f"File source {logical_name!r} has no resolved file_path; configure an explicit path."
+                    )
+                    result["checked_sources"].append(item)
+                    continue
+
+                # Only infer formats from unambiguous file extensions. Do not
+                # guess a base path or replace a missing file with another source.
+                clean_path = file_path.split("?", 1)[0].rstrip("/")
+                extension = os.path.splitext(clean_path)[1].lower()
+                declared_format = source.get("format") or source.get("file_format")
+                format_map = {".csv": "csv", ".parquet": "parquet", ".json": "json", ".jsonl": "json"}
+                file_format = str(declared_format).lower() if declared_format else format_map.get(extension)
+                if file_format not in {"csv", "parquet", "json", "delta", "orc", "avro"}:
+                    item["status"] = "unavailable"
+                    item["error"] = f"Cannot resolve a supported file format from metadata/path (extension={extension!r})."
+                    result["blocking_issues"].append(
+                        f"File source {logical_name!r} has no explicit supported format and its extension is not recognized."
+                    )
+                    result["checked_sources"].append(item)
+                    continue
+
+                try:
+                    reader = self.spark.read.format(file_format)
+                    if file_format == "csv":
+                        reader = reader.options(**self.csv_defaults)
+                    dataframe = reader.load(file_path)
+                    actual_columns = [field.name for field in dataframe.schema.fields]
+                    actual_by_casefold = {name.casefold(): name for name in actual_columns}
+                    item["status"] = "available"
+                    item["format"] = file_format
+                    item["actual_columns"] = actual_columns
+                    declared_columns = self._source_column_names(
+                        source.get("columns") or source.get("fields") or source.get("ports") or []
+                    )
+                    if declared_columns:
+                        missing = [name for name in declared_columns if name.casefold() not in actual_by_casefold]
+                        item["declared_columns"] = declared_columns
+                        item["missing_declared_columns"] = missing
+                        if missing:
+                            item["status"] = "schema_mismatch"
+                            result["blocking_issues"].append(
+                                f"File source {logical_name!r} at {file_path!r} is missing declared columns: {missing}."
+                            )
+                    source["source_preflight_status"] = item["status"]
+                    source["resolved_file_format"] = file_format
+                except Exception as exc:
+                    item["status"] = "unavailable"
+                    item["error"] = str(exc)[:500]
+                    source["source_preflight_status"] = "unavailable"
+                    result["blocking_issues"].append(
+                        f"File source {logical_name!r} at {file_path!r} cannot be read: {str(exc)[:300]}"
+                    )
+                result["checked_sources"].append(item)
+                continue
+
+            result["blocking_issues"].append(
+                f"Source {logical_name!r} has unresolved location metadata. "
+                "Configure its source location or provide an explicit source override."
+            )
+
+        result["ready"] = not result["blocking_issues"]
+        # Keep the resolved source metadata in the LLM input for traceability.
+        llm_input["source_preflight"] = result
+        existing_blockers = llm_input.get("blocking_issues", [])
+        if not isinstance(existing_blockers, list):
+            existing_blockers = [str(existing_blockers)]
+        llm_input["blocking_issues"] = list(existing_blockers) + list(result["blocking_issues"])
+        return result
+
+    def _enrich_target_metadata_from_catalog(self, llm_input):
+        """Best-effort target schema enrichment; never fail a mapping because
+        a not-yet-created target table is absent or Spark Connect defers analysis.
+
+        Existing XML metadata is preserved. This method does not invent merge keys
+        and does not create or write target tables.
+        """
+        if not isinstance(llm_input, dict):
+            return
+
+        targets = llm_input.get("targets", [])
+        if not isinstance(targets, list):
+            targets = []
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+
+            table_name = target.get("physical_table")
+            if not table_name:
+                continue
+
+            operation = str(target.get("operation", "")).upper()
+            requires_merge_keys = operation in {"UPSERT", "MERGE"}
+
+            # XML already supplied the necessary metadata: don't query the catalog.
+            if target.get("columns") and (
+                target.get("merge_keys") or not requires_merge_keys
+            ):
+                continue
+
+            try:
+                df = self.spark.table(str(table_name))
+                # Spark Connect may defer missing-table errors until schema is read.
+                catalog_columns = [
+                    {
+                        "name": field.name,
+                        "type": field.dataType.simpleString(),
+                        "nullable": bool(field.nullable),
+                    }
+                    for field in df.schema.fields
+                ]
+            except Exception as exc:
+                target["catalog_lookup_status"] = "unavailable"
+                target["catalog_lookup_error"] = str(exc)[:500]
+                print(
+                    f"[DEBUG] Catalog schema unavailable for target {table_name}; "
+                    "preserving XML metadata and continuing."
+                )
+                continue
+
+            target["catalog_lookup_status"] = "available"
+            if not target.get("columns") and catalog_columns:
+                target["columns"] = catalog_columns
+                target["target_schema_source"] = "existing_catalog_table"
+
+            # Deliberately do not infer merge keys from column names or data.
+
+        # Clear only blockers that are actually resolved by supplied metadata.
+        blockers = llm_input.get("blocking_issues", []) or []
+        filtered_blockers = []
+        for blocker in blockers:
+            blocker_text = str(blocker)
+            resolved = False
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                table_name = target.get("physical_table")
+                if not table_name or str(table_name) not in blocker_text:
+                    continue
+                if "has no target columns/schema declared" in blocker_text and target.get("columns"):
+                    resolved = True
+                    break
+                if "does not define merge keys" in blocker_text and target.get("merge_keys"):
+                    resolved = True
+                    break
+            if not resolved:
+                filtered_blockers.append(blocker_text)
+        llm_input["blocking_issues"] = filtered_blockers
+
+    # ============================================================
+
+    # LLM INPUT SUMMARY
+
+    # ============================================================
+
+    @staticmethod
+
+    def print_llm_input_summary(
+
+        mapping_name,
+
+        llm_input
+
+    ):
+
+        """
+
+        Print only the important metadata summary.
+
+        """
+
+        sources = llm_input.get(
+
+            "sources",
+
+            []
+
+        )
+
+        transformations = llm_input.get(
+
+            "transformations",
+
+            []
+
+        )
+
+        targets = llm_input.get(
+
+            "targets",
+
+            []
+
+        )
+
+        links = llm_input.get(
+
+            "links",
+
+            []
+
+        )
+
+        graph = llm_input.get(
+
+            "graph",
+
+            {}
+
+        )
+
+        execution_order = graph.get(
+
+            "execution_order",
+
+            []
+
+        )
+
+        transformation_types = sorted(
+
+            {
+
+                transformation.get("type")
+
+                for transformation in transformations
+
+                if isinstance(
+
+                    transformation,
+
+                    dict
+
+                )
+
+                and transformation.get("type")
+
+            }
+
+        )
+
+        stored_procedures = [
+
+            transformation
+
+            for transformation in transformations
+
+            if isinstance(
+
+                transformation,
+
+                dict
+
+            )
+
+            and str(
+
+                transformation.get(
+
+                    "type",
+
+                    ""
+
+                )
+
+            ).upper()
+
+            == "STORED_PROCEDURE"
+
+        ]
+
+        print(
+
+            f"\nLLM input ready: {mapping_name}"
+
+        )
+
+        print(
+
+            f"  Sources            : {len(sources)}"
+
+        )
+
+        print(
+
+            f"  Transformations    : "
+
+            f"{len(transformations)}"
+
+        )
+
+        print(
+
+            f"  Targets            : {len(targets)}"
+
+        )
+
+        print(
+
+            f"  Links              : {len(links)}"
+
+        )
+
+        print(
+
+            f"  Execution nodes    : "
+
+            f"{len(execution_order)}"
+
+        )
+
+        # --------------------------------------------------------
+
+        # Transformation types
+
+        # --------------------------------------------------------
+
+        transformation_type_text = (
+
+            ", ".join(
+
+                transformation_types
+
+            )
+
+            if transformation_types
+
+            else "None"
+
+        )
+
+        print(
+
+            f"  Transformation types: "
+
+            f"{transformation_type_text}"
+
+        )
+
+        # --------------------------------------------------------
+
+        # Stored procedures
+
+        # --------------------------------------------------------
+
+        if stored_procedures:
+
+            print(
+
+                f"  Stored procedures  : "
+
+                f"{len(stored_procedures)}"
+
+            )
+
+            for procedure in stored_procedures:
+
+                procedure_name = (
+
+                    procedure.get(
+
+                        "procedureName"
+
+                    )
+
+                    or procedure.get(
+
+                        "procedure_name"
+
+                    )
+
+                    or procedure.get(
+
+                        "name"
+
+                    )
+
+                )
+
+                print(
+
+                    f"    - {procedure_name}"
+
+                )
+
+                print(
+
+                    "      SP logic will be "
+
+                    "converted to PySpark by LLM."
+
+                )
+
+    # ============================================================
+
+    # PYSPARK VALIDATION
+
+    # ============================================================
+
+    @staticmethod
+
+    def validate_llm_pyspark(
+
+        mapping_name,
+
+        llm_input,
+
+        generated_code,
+
+        spark=None
+
+    ):
+
+        """
+
+        Validate LLM-generated PySpark code.
+
+        """
+
+        print(
+
+            "\nPySpark validation:"
+
+        )
+
+        validator = LLMPySparkValidator(
+
+            generated_code=generated_code,
+
+            llm_input=llm_input,
+
+            spark=spark
+
+        )
+
+        validation_result = (
+
+            validator.validate()
+
+        )
+
+        errors = validation_result.get(
+
+            "errors",
+
+            []
+
+        )
+
+        warnings = validation_result.get(
+
+            "warnings",
+
+            []
+
+        )
+
+        validation_status = (
+
+            "VALID"
+
+            if validation_result.get(
+
+                "valid"
+
+            )
+
+            else "INVALID"
+
+        )
+
+        print(
+
+            f"  Status   : {validation_status}"
+
+        )
+
+        print(
+
+            f"  Errors   : {len(errors)}"
+
+        )
+
+        print(
+
+            f"  Warnings : {len(warnings)}"
+
+        )
+
+        if errors:
+
+            for error in errors:
+
+                print(
+
+                    f"    ERROR: {error}"
+
+                )
+
+        if warnings:
+
+            for warning in warnings:
+
+                print(
+
+                    f"    WARNING: {warning}"
+
+                )
+
+        return validation_result
+
+    # ============================================================
+
+    # SAVE LLM RESULT
+
+    # ============================================================
+
+    def save_llm_result(
+
+        self,
+
+        mapping_name,
+
+        llm_result
+
+    ):
+
+        """
+
+        Save complete LLM response as JSON.
+
+        """
+
+        output_directory = os.path.join(
+
+            self.output_dir,
+
+            "llm_results"
+
+        )
+
+        os.makedirs(
+
+            output_directory,
+
+            exist_ok=True
+
+        )
+
+        safe_name = self._safe_filename(
+
+            mapping_name
+
+        )
 
         filename = (
-            f"{self._safe_filename(mapping_name)}__"
-            f"{self._safe_filename(table_name)}.sql"
+
+            f"{safe_name}_llm_result.json"
+
         )
 
         output_path = os.path.join(
+
             output_directory,
+
             filename
+
         )
 
         with open(
+
             output_path,
+
             "w",
+
             encoding="utf-8"
-        ) as file:
-            file.write(ddl)
+
+        ) as file_handle:
+
+            json.dump(
+
+                llm_result,
+
+                file_handle,
+
+                indent=2,
+
+                ensure_ascii=False
+
+            )
 
         return output_path
 
     # ============================================================
-    # TARGET TABLE VALIDATION
+
+    # SAVE GENERATED PYSPARK
+
     # ============================================================
 
-    def validate_target_tables(self, mapping_name, ir, folder):
-        """Validate generated target Delta tables exist and match target metadata."""
+    def save_generated_pyspark(
 
-        self.print_section(
-            f"TARGET DELTA TABLE VALIDATION : {mapping_name}"
+        self,
+
+        mapping_name,
+
+        generated_code
+
+    ):
+
+        """
+
+        Save generated PySpark as a .py artifact.
+
+        """
+
+        os.makedirs(
+
+            self.output_dir,
+
+            exist_ok=True
+
         )
 
-        ir_targets = ir.get("target", [])
-        if isinstance(ir_targets, dict):
-            ir_targets = [ir_targets]
+        safe_name = self._safe_filename(
 
-        repository_targets = folder.get("targets", [])
-        if not isinstance(repository_targets, list):
-            repository_targets = []
+            mapping_name
 
-        validated_tables = []
-
-        try:
-            for ir_target in ir_targets:
-                if not isinstance(ir_target, dict):
-                    raise ValueError("Invalid target metadata in IR")
-
-                target_name = (
-                    ir_target.get("target")
-                    or ir_target.get("name")
-                )
-
-                repository_target = next(
-                    (
-                        target
-                        for target in repository_targets
-                        if isinstance(target, dict)
-                        and (
-                            target.get("name") == target_name
-                            or target.get("name") == ir_target.get("name")
-                        )
-                    ),
-                    None
-                )
-
-                metadata = repository_target or ir_target
-
-                catalog = (
-                    metadata.get("catalog")
-                    or ir_target.get("catalog")
-                    or "idmc_poc"
-                )
-
-                schema = (
-                    metadata.get("schema")
-                    or ir_target.get("schema")
-                    or "silver"
-                )
-
-                table_name = metadata.get("name") or target_name
-                full_table_name = f"{catalog}.{schema}.{table_name}"
-
-                table_df = self.spark.table(full_table_name)
-                actual_columns = table_df.columns
-
-                expected_columns = [
-                    column.get("name")
-                    for column in metadata.get("columns", [])
-                    if isinstance(column, dict) and column.get("name")
-                ]
-
-                if not expected_columns:
-                    expected_columns = [
-                        port.get("name")
-                        for port in ir_target.get("ports", [])
-                        if isinstance(port, dict) and port.get("name")
-                    ]
-
-                missing_columns = [
-                    column for column in expected_columns
-                    if column not in actual_columns
-                ]
-
-                extra_columns = [
-                    column for column in actual_columns
-                    if column not in expected_columns
-                ]
-
-                if missing_columns or extra_columns:
-                    raise ValueError(
-                        f"Schema mismatch for {full_table_name}. "
-                        f"Missing: {missing_columns}; Extra: {extra_columns}"
-                    )
-
-                row_count = table_df.count()
-
-                print("Target :", full_table_name)
-                print("Status : VALID")
-                print("Columns:", len(actual_columns))
-                print("Rows   :", row_count)
-
-                validated_tables.append({
-                    "full_table_name": full_table_name,
-                    "table_df": table_df,
-                    "metadata": metadata
-                })
-
-            return {
-                "success": True,
-                "tables": validated_tables
-            }
-
-        except Exception as error:
-            print("Target : INVALID")
-            print("Error  :", str(error))
-            return {
-                "success": False,
-                "tables": [],
-                "error": str(error)
-            }
-
-    def validate_migration_data(self, mapping_name, ir, folder):
-        """
-        Perform S-3 data reconciliation against a reference expected dataset.
-
-        For the current POC mapping, the reference dataset is built from the
-        known Bronze test data independently of the generated target code.
-        This proves that the migrated result matches the expected business
-        result rather than only proving that the target table exists.
-        """
-
-        self.print_section(
-            f"DATA RECONCILIATION : {mapping_name}"
         )
 
-        try:
-            targets = ir.get("target", [])
-            if isinstance(targets, dict):
-                targets = [targets]
+        output_path = os.path.join(
 
-            if not targets:
-                raise ValueError("No target found for data reconciliation")
+            self.output_dir,
 
-            target = targets[0]
-            target_name = target.get("target") or target.get("name")
+            f"{safe_name}.py"
 
-            repository_target = next(
-                (
-                    item for item in folder.get("targets", [])
-                    if isinstance(item, dict)
-                    and item.get("name") in {target_name, target.get("name")}
-                ),
-                None
-            )
-
-            metadata = repository_target or target
-            catalog = metadata.get("catalog") or target.get("catalog") or "idmc_poc"
-            schema = metadata.get("schema") or target.get("schema") or "silver"
-            table_name = metadata.get("name") or target_name
-            full_table_name = f"{catalog}.{schema}.{table_name}"
-
-            actual_df = self.spark.table(full_table_name)
-            expected_df = self.build_reference_expected_dataframe(
-                mapping_name=mapping_name,
-                target_name=table_name
-            )
-
-            key_columns = self.get_reconciliation_keys(
-                mapping_name=mapping_name,
-                target_name=table_name,
-                expected_df=expected_df
-            )
-
-            report = self.data_validator.validate(
-                expected_df=expected_df,
-                actual_df=actual_df,
-                key_columns=key_columns
-            )
-
-            self.data_validator.print_report(report)
-
-            return report
-
-        except Exception as error:
-            print("DATA RECONCILIATION : FAILED")
-            print("Error:", str(error))
-            return {
-                "overall_status": "FAIL",
-                "schema_validation": "FAIL",
-                "row_count_validation": "FAIL",
-                "data_validation": "FAIL",
-                "errors": [str(error)]
-            }
-
-    def get_reconciliation_keys(self, mapping_name, target_name, expected_df):
-        """Return business keys used for key-based data comparison."""
-
-        if mapping_name == "m_customer_order_summary" or target_name == "CUSTOMER_ORDER_SUMMARY":
-            return ["CUSTOMER_ID"]
-
-        # Generic fallback: use the first column when no explicit key is
-        # available. A future XML metadata extension can supply true keys.
-        if expected_df.columns:
-            return [expected_df.columns[0]]
-
-        return []
-
-    def build_reference_expected_dataframe(self, mapping_name, target_name):
-        """
-        Build the independent expected result for the current POC mapping.
-
-        This reference logic is intentionally separate from generated PySpark.
-        It represents the expected migration result for the controlled Bronze
-        test dataset used by the old XML regression case.
-        """
-
-        if mapping_name != "m_customer_order_summary" and target_name != "CUSTOMER_ORDER_SUMMARY":
-            raise ValueError(
-                f"No reference expected dataset is configured for mapping '{mapping_name}' "
-                f"and target '{target_name}'"
-            )
-
-        customer = self.spark.table("idmc_poc.bronze.CUSTOMER")
-        orders = self.spark.table("idmc_poc.bronze.ORDERS")
-        country_master = self.spark.table("idmc_poc.bronze.COUNTRY_MASTER")
-
-        expected_df = (
-            customer
-            .select(
-                "CUSTOMER_ID",
-                F.upper(F.trim(F.col("CUSTOMER_NAME"))).alias("CUSTOMER_NAME"),
-                "COUNTRY_CODE"
-            )
-            .join(
-                orders
-                .filter(
-                    (F.col("ORDER_STATUS") == "COMPLETED")
-                    & (F.col("ORDER_AMOUNT") > 0)
-                )
-                .select(
-                    "CUSTOMER_ID",
-                    "ORDER_ID",
-                    "ORDER_DATE",
-                    "ORDER_AMOUNT"
-                ),
-                "CUSTOMER_ID",
-                "inner"
-            )
-            .join(
-                country_master.select(
-                    "COUNTRY_CODE",
-                    "COUNTRY_NAME",
-                    "REGION"
-                ),
-                "COUNTRY_CODE",
-                "left"
-            )
-            .groupBy(
-                "CUSTOMER_ID",
-                "CUSTOMER_NAME",
-                "COUNTRY_NAME",
-                "REGION"
-            )
-            .agg(
-                F.count("ORDER_ID").cast("int").alias("TOTAL_ORDERS"),
-                F.sum("ORDER_AMOUNT").cast("decimal(18,2)").alias("TOTAL_AMOUNT"),
-                F.max("ORDER_DATE").cast("date").alias("LAST_ORDER_DATE")
-            )
-            .select(
-                "CUSTOMER_ID",
-                "CUSTOMER_NAME",
-                "COUNTRY_NAME",
-                "REGION",
-                "TOTAL_ORDERS",
-                "TOTAL_AMOUNT",
-                "LAST_ORDER_DATE"
-            )
         )
 
-        return expected_df
+        with open(
 
-    def execute_pyspark(self, mapping_name, generated_code):
+            output_path,
+
+            "w",
+
+            encoding="utf-8"
+
+        ) as file_handle:
+
+            file_handle.write(
+
+                generated_code.rstrip()
+
+                + "\n"
+
+            )
+
+        return output_path
+
+    # ============================================================
+
+    # EXECUTE GENERATED PYSPARK
+
+    # ============================================================
+
+    def execute_pyspark(self, mapping_name):
+        """Execute exactly one mapping-specific generated PySpark entry point.
+
+        Accepts the exact mapping name or a constrained execution prefix
+        (migrate_, run_, execute_) followed by that exact mapping name.
+        Only top-level functions are eligible; nested helper functions are not.
         """
-        Execute the persisted generated PySpark artifact inside the existing
-        Spark session.
-
-        The generated .py file is the migration artifact produced by
-        save_generated_pyspark(). The execution step deliberately reads and
-        executes that saved artifact rather than executing the in-memory
-        generated_code string. This ensures the artifact that is preserved
-        for deployment/review is the same implementation that is actually
-        executed during migration.
-        """
-
-        self.print_section(
-            f"PYSPARK EXECUTION : {mapping_name}"
-        )
+        import ast
 
         artifact_path = os.path.join(
             self.output_dir,
-            f"{self._safe_filename(mapping_name)}.py"
+            f"{self._safe_filename(mapping_name)}.py",
+        )
+
+        if not os.path.isfile(artifact_path):
+            raise FileNotFoundError(
+                f"Generated PySpark artifact not found: {artifact_path}"
+            )
+
+        with open(artifact_path, "r", encoding="utf-8") as handle:
+            persisted_code = handle.read()
+
+        if not persisted_code.strip():
+            raise ValueError(
+                f"Generated PySpark artifact is empty: {artifact_path}"
+            )
+
+        def normalize(value):
+            return re.sub(
+                r"[^a-z0-9]+", "_", str(value).lower()
+            ).strip("_")
+
+        normalized_mapping = normalize(mapping_name)
+
+        # Prefixes are constrained to the exact normalized mapping name.
+        # Explicit legacy aliases remain for earlier generated artifacts.
+        approved_names = {
+            normalized_mapping,
+            f"migrate_{normalized_mapping}",
+            f"run_{normalized_mapping}",
+            f"execute_{normalized_mapping}",
+            # Some valid LLM-generated artifacts expose a generic entry point.
+            # The artifact filename is already scoped to this mapping, and we
+            # still require exactly one top-level match before executing it.
+            "run_migration",
+        }
+        legacy_aliases = {
+            "m_customer_standardize": {"migrate_customer_standardize"},
+            "m_order_enrichment": {"migrate_orders", "migrate_order_enrichment"},
+            "m_inventory_reconciliation": {"migrate_inventory_reconciliation"},
+            "m_daily_sales_summary": {"migrate_daily_sales_summary"},
+        }
+        approved_names.update(
+            normalize(name)
+            for name in legacy_aliases.get(normalized_mapping, set())
         )
 
         try:
-            if not os.path.exists(artifact_path):
-                raise FileNotFoundError(
-                    f"Generated PySpark artifact not found: {artifact_path}"
-                )
+            syntax_tree = ast.parse(persisted_code, filename=artifact_path)
+        except SyntaxError as exc:
+            raise RuntimeError(
+                f"Generated PySpark has a syntax error in {artifact_path}: {exc}"
+            ) from exc
 
-            with open(artifact_path, "r", encoding="utf-8") as file_handle:
-                persisted_code = file_handle.read()
+        # Only top-level function definitions can be migration entry points.
+        top_level_functions = [
+            node.name
+            for node in syntax_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        matching_names = [
+            name for name in top_level_functions
+            if normalize(name) in approved_names
+        ]
 
-            if not persisted_code.strip():
-                raise ValueError(
-                    f"Generated PySpark artifact is empty: {artifact_path}"
-                )
+        if len(matching_names) != 1:
+            raise RuntimeError(
+                f"Expected exactly one mapping-specific entry point for "
+                f"{mapping_name!r}; found {matching_names}. "
+                f"Top-level functions: {top_level_functions}. "
+                f"Approved names: {sorted(approved_names)}. "
+                f"Review {artifact_path} before execution."
+            )
 
-            execution_namespace = {
-                "spark": self.spark
+        function_name = matching_names[0]
+
+        # The expected entry point is confirmed before module execution.
+        namespace = {
+            "__builtins__": __builtins__,
+            "__name__": "__migration_generated__",
+            "spark": self.spark,
+        }
+        exec(
+            compile(persisted_code, artifact_path, "exec"),
+            namespace,
+            namespace,
+        )
+
+        function = namespace.get(function_name)
+        if not inspect.isfunction(function):
+            raise RuntimeError(
+                f"Entry point {function_name!r} did not load as a function."
+            )
+
+        if inspect.iscoroutinefunction(function):
+            raise RuntimeError(
+                f"Async entry point {function_name!r} is not supported."
+            )
+
+        parameters = list(inspect.signature(function).parameters.values())
+
+        if not parameters:
+            # Supports older generated functions that use injected global spark.
+            return function()
+
+        if (
+            len(parameters) == 1
+            and parameters[0].name in {"spark", "spark_session", "session"}
+            and parameters[0].kind in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
             }
+        ):
+            return function(self.spark)
 
-            # Compile using the artifact path so any runtime error points to
-            # the actual generated .py file rather than an in-memory string.
-            compiled_code = compile(
-                persisted_code,
-                artifact_path,
-                "exec"
+        raise RuntimeError(
+            f"Unsupported signature for {function_name!r}: "
+            f"{inspect.signature(function)}. "
+            "Expected no parameters or exactly one Spark-session parameter "
+            "named spark, spark_session, or session."
+        )
+
+    @staticmethod
+    def _compact_result(result):
+        """Compact notebook summary that retains Human Gateway review details."""
+        validation = result.get("validation", {}) or {}
+        stage = result.get("stage", "UNKNOWN")
+        human_review = result.get("human_review") or {}
+
+        return {
+            "mapping_name": result.get("mapping_name", "Unknown"),
+            "success": bool(result.get("success")),
+            "stage": stage,
+            "dry_run": result.get("dry_run"),
+            "executed": result.get(
+                "executed",
+                stage in {"COMPLETED", "DATA_VALIDATION"},
+            ),
+            "validation_status": (
+                "VALID"
+                if validation.get("valid")
+                else ("INVALID" if validation else "NOT_REPORTED")
+            ),
+            "error_count": len(validation.get("errors", []) or []),
+            "warning_count": len(validation.get("warnings", []) or []),
+            "review_id": result.get("review_id") or human_review.get("review_id"),
+            "review_status": human_review.get("status"),
+            "review_scope": human_review.get("scope"),
+            "review_issues": human_review.get("issues", []),
+            "review_decision": human_review.get("decision"),
+            "generated_pyspark": result.get("generated_pyspark"),
+            "llm_result_path": result.get("llm_result_path"),
+            "error": result.get("error"),
+        }
+
+    # FINAL SUMMARY
+
+    # ============================================================
+
+    @staticmethod
+
+    def print_final_summary(
+
+        migration_results
+
+    ):
+
+        """
+
+        Print concise final migration summary.
+
+        """
+
+        total = len(
+
+            migration_results
+
+        )
+
+        successful = sum(
+
+            1
+
+            for result in migration_results
+
+            if result.get("success")
+
+        )
+
+        failed = (
+
+            total
+
+            - successful
+
+        )
+
+        print(
+
+            "\n" + "=" * 60
+
+        )
+
+        print(
+
+            "MIGRATION SUMMARY"
+
+        )
+
+        print(
+
+            "=" * 60
+
+        )
+
+        print(
+
+            f"Mappings Processed : {total}"
+
+        )
+
+        print(
+
+            f"Successful         : {successful}"
+
+        )
+
+        print(
+
+            f"Failed             : {failed}"
+
+        )
+
+        if migration_results:
+
+            print(
+
+                "\nMapping Results:"
+
             )
 
-            exec(
-                compiled_code,
-                execution_namespace
-            )
+            for result in migration_results:
 
-            print("Execution Artifact:", artifact_path)
-            print("Execution : SUCCESS")
+                mapping_name = result.get(
 
-        except Exception as error:
-            print("Execution : FAILED")
-            print("Artifact:", artifact_path)
-            print("Error:", str(error))
-            raise
+                    "mapping_name",
+
+                    "Unknown"
+
+                )
+
+                status = (
+
+                    "SUCCESS"
+
+                    if result.get(
+
+                        "success"
+
+                    )
+
+                    else "FAILED"
+
+                )
+
+                print(
+
+                    f"  {mapping_name} : {status}"
+
+                )
+
+                if not result.get(
+
+                    "success"
+
+                ):
+
+                    print(
+
+                        f"    Stage : "
+
+                        f"{result.get('stage')}"
+
+                    )
+
+                    if result.get(
+
+                        "error"
+
+                    ):
+
+                        print(
+
+                            f"    Error : "
+
+                            f"{result.get('error')}"
+
+                        )
+
+        print(
+
+            "\n" + "=" * 60
+
+        )
+
+    # ============================================================
+
+    # SAFE FILE NAME
+
+    # ============================================================
+
+    @staticmethod
+
+    def _safe_filename(
+
+        name
+
+    ):
+
+        """
+
+        Convert mapping name into a safe file name.
+
+        """
+
+        value = str(
+
+            name or "migration"
+
+        )
+
+        value = re.sub(
+
+            r"[^A-Za-z0-9._-]+",
+
+            "_",
+
+            value
+
+        )
+
+        value = value.strip(
+
+            "._"
+
+        )
+
+        return (
+
+            value
+
+            or "migration"
+
+        )
