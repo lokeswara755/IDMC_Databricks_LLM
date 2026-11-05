@@ -1,0 +1,100 @@
+{
+  "generated_at_utc": "2026-11-04T13:40:13.199984+00:00",
+  "xml_path": "/Volumes/idmc_poc/bronze/idmc_files/IDMC_EnterpriseCustomer360_MAP100_POC_key_approved.xml",
+  "output_directory": "/Volumes/idmc_poc/bronze/idmc_files/generated_pyspark/enterprise_customer360",
+  "dry_run": true,
+  "execution_approved": false,
+  "allow_synthetic_merge_keys": false,
+  "mappings_discovered": 9,
+  "mapping_results_returned": 0,
+  "successful_mappings": 0,
+  "failed_mappings": 0,
+  "mappings_with_generated_pyspark": 9,
+  "generated_python_files": 9,
+  "total_source_instances": 21,
+  "total_transformations": 55,
+  "total_target_instances": 17,
+  "pipeline_error": "OSError: [Errno 5] Input/output error",
+  "inventory": [
+    {
+      "component": "Asset Folders",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Mappings",
+      "count": 9,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Mapping Tasks",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Taskflows",
+      "count": 3,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Reusable Taskflows",
+      "count": 0,
+      "status": "NOT CAPTURED / ZERO"
+    },
+    {
+      "component": "Runtime Parameter Files",
+      "count": 0,
+      "status": "NOT CAPTURED / ZERO"
+    },
+    {
+      "component": "Runtime Parameters",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Data Quality Rules",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Data Ingestion Jobs",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Application Integration Processes",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "APIs",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "AI Recommendations",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Metadata Relationships",
+      "count": 2,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Mapping Source Instances",
+      "count": 21,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Mapping Transformations",
+      "count": 55,
+      "status": "AVAILABLE"
+    },
+    {
+      "component": "Mapping Target Instances",
+      "count": 17,
+      "status": "AVAILABLE"
+    }
+  ]
+}

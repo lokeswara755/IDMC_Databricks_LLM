@@ -68,47 +68,6 @@ def make_json_serializable(obj):
 
 
 
-from datetime import date, datetime
-from decimal import Decimal
-from dataclasses import asdict, is_dataclass
-
-
-def make_json_serializable(obj):
-    """Convert parsed IDMC metadata into values supported by json.dump."""
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-
-    if isinstance(obj, Decimal):
-        return str(obj)
-
-    if is_dataclass(obj):
-        return make_json_serializable(asdict(obj))
-
-    if isinstance(obj, dict):
-        return {
-            str(key): make_json_serializable(value)
-            for key, value in obj.items()
-        }
-
-    if isinstance(obj, (list, tuple, set)):
-        values = list(obj)
-        if isinstance(obj, set):
-            values = sorted(values, key=repr)
-        return [make_json_serializable(value) for value in values]
-
-    if hasattr(obj, "to_dict") and callable(obj.to_dict):
-        return make_json_serializable(obj.to_dict())
-
-    if hasattr(obj, "__dict__"):
-        return make_json_serializable(vars(obj))
-
-    # Keep the save operation from failing on unexpected parser-specific types.
-    return str(obj)
-
-
 class MigrationPipeline:
 
     def __init__(
@@ -138,6 +97,7 @@ class MigrationPipeline:
         verbose=False,
         human_review_dir=None,
         approved_review_id=None,
+        approved_review_ids=None,
     ):
 
         self.xml_path = xml_path
@@ -160,7 +120,10 @@ class MigrationPipeline:
             self.output_dir, "human_reviews"
         )
         self.human_gateway = HumanGateway(review_dir=self.human_review_dir)
+        # One review ID per mapping enables repository-wide processing. The
+        # singular parameter remains supported for backward compatibility.
         self.approved_review_id = approved_review_id
+        self.approved_review_ids = dict(approved_review_ids or {})
 
         if not self.dry_run and not self.execution_approved:
             raise ValueError(
@@ -204,7 +167,10 @@ class MigrationPipeline:
 
         self.graph_builder = GraphBuilder()
 
-        self.llm_input_builder = LLMInputBuilder(csv_defaults=self.csv_defaults)
+        self.llm_input_builder = LLMInputBuilder(
+            csv_defaults=self.csv_defaults,
+            metadata_xml_path=self.xml_path,
+        )
 
         self.llm_generator = LLMGenerator(
 
@@ -248,24 +214,277 @@ class MigrationPipeline:
             review_id=review_id, decision=decision, reviewer=reviewer, comment=comment
         )
 
-    def _approved_review_matches(self, mapping_name, category):
-        """Check an explicitly supplied approved review; never infer approval."""
-        if not self.approved_review_id:
+    @staticmethod
+    def _map100_expected_approval_evidence():
+        """Return the exact, narrowly scoped MAP100 merge-key approval payload."""
+        return {
+            "approval_type": "POC_MERGE_KEY_APPROVAL",
+            "mapping_name": "m_customer_360_enrichment",
+            "merge_keys": ["customer_id"],
+            "targets": [
+                "idmc_poc.curated.customer_gold",
+                "idmc_poc.curated.customer_standard",
+                "idmc_poc.curated.customer_low_value",
+            ],
+            "approval_scope": "MAP100",
+            "provenance": "HUMAN_APPROVED_POC_ASSUMPTION",
+            "xml_authoritative": False,
+            "execution_approved": False,
+        }
+
+    def _approved_review_matches(
+        self, mapping_name, category, expected_evidence=None, scope=None
+    ):
+        """Validate a persisted approval, including its exact evidence and scope.
+
+        A review category or mapping-name match alone is never sufficient.
+        Technical validation failures remain non-overridable by HumanGateway.
+        """
+        review_id = (
+            self.approved_review_ids.get(mapping_name)
+            or self.approved_review_id
+        )
+        if not review_id:
             return False
-        review = self.human_gateway.get_review(self.approved_review_id)
+
+        try:
+            review = self.human_gateway.get_review(review_id)
+        except Exception:
+            return False
+
         if review.get("mapping_name") != mapping_name:
             return False
-        reviewed_categories = {
-            str(i.get("category", "")).upper() for i in review.get("issues", [])
-        }
-        reviewed_categories.update(
-            str(x).upper() for x in review.get("resolved_categories", [])
-        )
-        if category.upper() not in reviewed_categories:
+        if scope is not None and review.get("scope") != scope:
             return False
-        return self.human_gateway.can_proceed(
-            review, execution_approved=self.execution_approved
+
+        decision = review.get("decision") or {}
+        if not isinstance(decision, dict):
+            return False
+        if str(decision.get("decision", "")).upper() != "APPROVE":
+            return False
+
+        if review.get("status") != PASS:
+            return False
+        if review.get("validations_passed") is not True:
+            return False
+
+        resolved_categories = {
+            str(value).upper()
+            for value in (review.get("resolved_categories") or [])
+        }
+        if category.upper() not in resolved_categories:
+            return False
+
+        if (
+            isinstance(expected_evidence, dict)
+            and expected_evidence.get("approval_type") == "MAPPING_MERGE_KEY_APPROVAL"
+            and any(
+                not item.get("merge_keys")
+                for item in (expected_evidence.get("targets") or [])
+                if isinstance(item, dict)
+            )
+        ):
+            # A reviewer cannot approve an unspecified key. The mapping metadata
+            # must first be corrected with an explicit candidate key.
+            return False
+
+        if expected_evidence is not None:
+            evidence_matches = False
+            for issue in (review.get("resolved_issues") or []):
+                if not isinstance(issue, dict):
+                    continue
+                if str(issue.get("category", "")).upper() != category.upper():
+                    continue
+                evidence = issue.get("evidence") or {}
+                if isinstance(evidence, dict) and evidence == expected_evidence:
+                    evidence_matches = True
+                    break
+            if not evidence_matches:
+                return False
+
+        return bool(
+            self.human_gateway.can_proceed(
+                review, execution_approved=self.execution_approved
+            )
         )
+
+    def _map100_approval_required_result(self):
+        """Create a reviewable MAP100 approval request without running the LLM."""
+        evidence = self._map100_expected_approval_evidence()
+        message = (
+            "Approve customer_id as the POC business merge key for exactly "
+            "customer_gold, customer_standard and customer_low_value. "
+            "This is not authoritative IDMC XML metadata and does not approve execution."
+        )
+        review = self.human_gateway.create_review_item(
+            mapping_name="m_customer_360_enrichment",
+            category="UNVERIFIED_MERGE_KEY",
+            message=message,
+            severity="WARNING",
+            evidence=evidence,
+            validations_passed=True,
+            live_execution=False,
+            scope="MAP100",
+        )
+        return {
+            "success": False,
+            "mapping_name": "m_customer_360_enrichment",
+            "stage": "HUMAN_REVIEW",
+            "human_review": review,
+            "review_id": review["review_id"],
+            "error": message,
+            "dry_run": self.dry_run,
+            "executed": False,
+        }
+
+
+    @staticmethod
+    def _generic_merge_key_approval_evidence(mapping_name, llm_input):
+        """Build deterministic approval evidence for unverified keys in any mapping.
+
+        This records only keys already present in parsed metadata. It never
+        invents a key for a target whose merge key is missing.
+        """
+        approved_targets = []
+        for target in (llm_input.get("targets", []) or []):
+            if not isinstance(target, dict):
+                continue
+            attributes = target.get("attributes") or {}
+            if not isinstance(attributes, dict):
+                attributes = {}
+            status = (
+                target.get("merge_key_status")
+                or attributes.get("merge_key_status")
+                or target.get("merge_key_provenance")
+                or attributes.get("merge_key_provenance")
+                or ""
+            )
+            status_text = str(status).upper()
+            authoritative = target.get("merge_key_authoritative_from_xml")
+            keys = target.get("merge_keys") or attributes.get("merge_keys") or []
+            if isinstance(keys, str):
+                keys = [keys]
+            keys = sorted({str(k).strip() for k in keys if str(k).strip()})
+            # Only gate keys explicitly marked as synthetic/unverified/non-XML.
+            is_unverified = (
+                status_text in {
+                    "SYNTHETIC_POC",
+                    "APPROVED_POC_ASSUMPTION",
+                    "UNVERIFIED",
+                    "UNVERIFIED_MERGE_KEY",
+                    "HUMAN_APPROVED_POC_ASSUMPTION",
+                }
+                or authoritative is False
+            )
+            if not is_unverified:
+                continue
+            target_name = (
+                target.get("physical_table")
+                or target.get("target")
+                or target.get("logical_name")
+                or target.get("name")
+                or target.get("target_name")
+            )
+            if not target_name:
+                continue
+            approved_targets.append({
+                "target": str(target_name),
+                "merge_keys": keys,
+                "source_status": status_text or "NOT_XML_AUTHORITATIVE",
+            })
+
+        if not approved_targets:
+            return None
+
+        approved_targets.sort(key=lambda item: item["target"].casefold())
+        return {
+            "approval_type": "MAPPING_MERGE_KEY_APPROVAL",
+            "mapping_name": str(mapping_name),
+            "targets": approved_targets,
+            "provenance": "HUMAN_APPROVED_POC_ASSUMPTION",
+            "xml_authoritative": False,
+            "execution_approved": False,
+        }
+
+    def _generic_merge_key_approval_required_result(self, mapping_name, evidence):
+        """Persist a generic merge-key review request for the current mapping."""
+        empty_keys = [
+            item["target"] for item in evidence.get("targets", [])
+            if not item.get("merge_keys")
+        ]
+        if empty_keys:
+            message = (
+                "Merge keys are not declared for these targets: "
+                + ", ".join(empty_keys)
+                + ". Add the intended business key(s) to the mapping metadata "
+                  "before requesting approval; Human Gateway must not invent keys."
+            )
+        else:
+            message = (
+                "Review and approve the existing candidate merge keys for mapping "
+                f"{mapping_name}: "
+                + "; ".join(
+                    f'{item["target"]} => {item["merge_keys"]}'
+                    for item in evidence.get("targets", [])
+                )
+                + ". Approval applies only to these exact targets and keys; "
+                  "it does not authorize execution."
+            )
+        review = self.human_gateway.create_review_item(
+            mapping_name=mapping_name,
+            category="UNVERIFIED_MERGE_KEY",
+            message=message,
+            severity="WARNING",
+            evidence=evidence,
+            validations_passed=True,
+            live_execution=False,
+            scope="MAPPING",
+        )
+        return {
+            "success": False,
+            "mapping_name": mapping_name,
+            "stage": "HUMAN_REVIEW",
+            "human_review": review,
+            "review_id": review["review_id"],
+            "error": message,
+            "dry_run": self.dry_run,
+            "executed": False,
+        }
+
+    @staticmethod
+    def _apply_generic_merge_key_approval(llm_input, evidence):
+        """Annotate only the exact target/key pairs present in approved evidence."""
+        evidence_targets = {
+            (item["target"].casefold(), tuple(item.get("merge_keys") or []))
+            for item in evidence.get("targets", [])
+        }
+        for target in (llm_input.get("targets", []) or []):
+            if not isinstance(target, dict):
+                continue
+            target_name = (
+                target.get("physical_table")
+                or target.get("target")
+                or target.get("logical_name")
+                or target.get("name")
+                or target.get("target_name")
+            )
+            if not target_name:
+                continue
+            attributes = target.get("attributes") or {}
+            keys = target.get("merge_keys") or (
+                attributes.get("merge_keys") if isinstance(attributes, dict) else []
+            ) or []
+            if isinstance(keys, str):
+                keys = [keys]
+            key_tuple = tuple(sorted({str(k).strip() for k in keys if str(k).strip()}))
+            if (str(target_name).casefold(), key_tuple) not in evidence_targets:
+                continue
+            target["merge_key_status"] = "HUMAN_APPROVED_POC_ASSUMPTION"
+            target["merge_key_provenance"] = (
+                "HUMAN_APPROVED_POC_ASSUMPTION; not authoritative IDMC XML metadata."
+            )
+            target["merge_key_authoritative_from_xml"] = False
+        llm_input["human_approved_merge_key_evidence"] = evidence
 
     def parse_specialized_metadata(self, root, repository):
         """Parse additional IDMC assets and validate cross-references."""
@@ -555,7 +774,12 @@ class MigrationPipeline:
 
             )
 
-            # Full LLM responses remain in JSON files; return only compact status rows.
+            # Create an Excel summary from the actual per-mapping pipeline results.
+            report_paths = self.write_migration_report(migration_results)
+            self.last_report_paths = report_paths
+            print("Migration report files:", report_paths)
+
+            # Preserve the original public return contract: a list of compact rows.
             return [self._compact_result(result) for result in migration_results]
 
         except Exception as error:
@@ -678,6 +902,42 @@ class MigrationPipeline:
                 xml_path=self.xml_path,
                 specialized_metadata=self.metadata_bundle,
             )
+
+            # MAP100 has a separately approved, mapping-specific assumption.
+            # Keep that approval exact; do not reuse it for any other mapping.
+            if mapping_name == "m_customer_360_enrichment":
+                expected_evidence = self._map100_expected_approval_evidence()
+                if not self._approved_review_matches(
+                    mapping_name=mapping_name,
+                    category="UNVERIFIED_MERGE_KEY",
+                    expected_evidence=expected_evidence,
+                    scope="MAP100",
+                ):
+                    return self._map100_approval_required_result()
+
+            # General Human Gateway merge-key review for every other mapping.
+            # It only approves candidate keys already present in metadata.
+            else:
+                generic_evidence = self._generic_merge_key_approval_evidence(
+                    mapping_name, llm_input
+                )
+                if generic_evidence is not None:
+                    if not self._approved_review_matches(
+                        mapping_name=mapping_name,
+                        category="UNVERIFIED_MERGE_KEY",
+                        expected_evidence=generic_evidence,
+                        scope="MAPPING",
+                    ):
+                        return self._generic_merge_key_approval_required_result(
+                            mapping_name, generic_evidence
+                        )
+                    self._apply_generic_merge_key_approval(
+                        llm_input, generic_evidence
+                    )
+
+            # Apply only explicit POC overrides. Mapping-specific assumptions
+            # remain scoped and are never generalized to unrelated mappings.
+            self._apply_approved_poc_overrides(llm_input, mapping_name)
 
             if self.verbose:
                 print("LLM input built.")
@@ -1075,8 +1335,44 @@ class MigrationPipeline:
                 + ". A reviewer must confirm their use for this POC."
             )
 
+            post_generation_evidence = {
+                "approval_type": "MAPPING_MERGE_KEY_APPROVAL",
+                "mapping_name": str(mapping_name),
+                "targets": sorted(
+                    [
+                        {
+                            "target": str(target.get("physical_table")
+                                          or target.get("target")
+                                          or target.get("name")
+                                          or "unknown target"),
+                            "merge_keys": sorted(
+                                [str(k).strip() for k in (
+                                    target.get("merge_keys")
+                                    or (target.get("attributes") or {}).get("merge_keys")
+                                    or []
+                                ) if str(k).strip()]
+                            ),
+                            "source_status": "SYNTHETIC_POC",
+                        }
+                        for target in targets
+                        if isinstance(target, dict)
+                        and str(
+                            target.get("merge_key_status")
+                            or (target.get("attributes") or {}).get("merge_key_status")
+                            or ""
+                        ).upper() == "SYNTHETIC_POC"
+                    ],
+                    key=lambda item: item["target"].casefold(),
+                ),
+                "provenance": "HUMAN_APPROVED_POC_ASSUMPTION",
+                "xml_authoritative": False,
+                "execution_approved": False,
+            }
             approved = self._approved_review_matches(
-                mapping_name, "UNVERIFIED_MERGE_KEY"
+                mapping_name=mapping_name,
+                category="UNVERIFIED_MERGE_KEY",
+                expected_evidence=post_generation_evidence,
+                scope="MAPPING",
             )
 
             if not approved:
@@ -1114,7 +1410,7 @@ class MigrationPipeline:
                         "Set allow_synthetic_merge_keys=True only for an "
                         "explicitly approved POC run."
                     ),
-                    "review_id": self.approved_review_id,
+                    "review_id": (self.approved_review_ids.get(mapping_name) or self.approved_review_id),
                     "validation": validation_result,
                 }
 
@@ -1575,6 +1871,337 @@ class MigrationPipeline:
             existing_blockers = [str(existing_blockers)]
         llm_input["blocking_issues"] = list(existing_blockers) + list(result["blocking_issues"])
         return result
+
+    def _apply_approved_poc_overrides(self, llm_input, mapping_name):
+        """Apply narrowly scoped, user-approved POC assumptions.
+
+        This does not invent missing target schemas, join/filter conditions,
+        aggregation grouping, or SCD2 validity semantics. The override is
+        explicitly labelled as a POC assumption in the LLM input and reports.
+        """
+        if not isinstance(llm_input, dict):
+            return
+        normalized_mapping_name = str(mapping_name or "").strip()
+
+        # MAP100: the user approved customer_id as the POC business match key
+        # for the three Customer 360 UPSERT targets. This remains an explicitly
+        # labelled POC assumption, not authoritative IDMC metadata.
+        if normalized_mapping_name == "m_customer_360_enrichment":
+            approved_map100 = {
+                "mapping_name": normalized_mapping_name,
+                "status": "APPROVED_POC_ASSUMPTION",
+                "approved_by_user": True,
+                "assumptions": [{
+                    "targets": [
+                        "idmc_poc.curated.customer_gold",
+                        "idmc_poc.curated.customer_standard",
+                        "idmc_poc.curated.customer_low_value",
+                    ],
+                    "merge_keys": ["customer_id"],
+                    "purpose": "User-approved POC match key for the three Customer 360 targets.",
+                    "provenance": "HUMAN_APPROVED_POC_ASSUMPTION; not authoritative XML metadata.",
+                }],
+            }
+            for target in (llm_input.get("targets", []) or []):
+                if not isinstance(target, dict):
+                    continue
+                physical = str(target.get("physical_table") or "").strip().casefold()
+                logical = str(target.get("logical_name") or target.get("target") or target.get("name") or "").strip().casefold()
+                if physical in {
+                    "idmc_poc.curated.customer_gold",
+                    "idmc_poc.curated.customer_standard",
+                    "idmc_poc.curated.customer_low_value",
+                } or logical in {
+                    "curated.customer_gold", "curated.customer_standard",
+                    "curated.customer_low_value", "tgt_customer_gold",
+                    "tgt_customer_standard", "tgt_customer_low_value",
+                }:
+                    target["merge_keys"] = ["customer_id"]
+                    target["merge_key_status"] = "APPROVED_POC_ASSUMPTION"
+                    target["merge_key_provenance"] = (
+                        "HUMAN_APPROVED_POC_ASSUMPTION; not authoritative XML metadata."
+                    )
+                    target["merge_key_authoritative_from_xml"] = False
+
+            # The XML sequence is id=SEQ1, name=SEQ_CUSTOMER_SK, output customer_sk,
+            # startValue=100000, incrementBy=1. Attach the parsed semantics by name.
+            for transformation in (llm_input.get("transformations", []) or []):
+                if not isinstance(transformation, dict):
+                    continue
+                name = str(transformation.get("name") or transformation.get("id") or "").strip().casefold()
+                kind = str(transformation.get("type") or transformation.get("transformation_type") or "").casefold()
+                if name in {"seq_customer_sk", "seq1"} or ("sequence" in kind and "customer_sk" in str(transformation).casefold()):
+                    transformation["sequence_field"] = "customer_sk"
+                    transformation["output_field"] = "customer_sk"
+                    transformation["business_key"] = "customer_id"
+                    transformation["sequence_start"] = 100000
+                    transformation["sequence_increment"] = 1
+                    transformation["sequence_semantics_provenance"] = (
+                        "Parsed from IDMC SequenceTransformation SEQ_CUSTOMER_SK."
+                    )
+
+            # MAP100 reject-target audit fields are derivable from the mapping-local
+            # DQR109 rule reference and the declared reject target schema. Keep each
+            # derivation explicit and provenance-labelled; do not infer arbitrary
+            # target columns or apply repository-wide DQ rules.
+            mapping_rule_ids = set()
+            for rule in (llm_input.get("data_quality_rules", []) or []):
+                if not isinstance(rule, dict):
+                    continue
+                rule_id = str(rule.get("id") or rule.get("object_id") or rule.get("rule_id") or "").strip()
+                if rule_id:
+                    mapping_rule_ids.add(rule_id)
+            transformations_for_dq = llm_input.get("transformations", []) or []
+            mapping_rule_ids.update(
+                str(rule_id).strip()
+                for transformation in transformations_for_dq
+                if isinstance(transformation, dict)
+                for rule_id in (transformation.get("rule_refs") or transformation.get("rule_ids") or [])
+                if str(rule_id).strip()
+            )
+
+            reject_derivations = {
+                "dq_rule_id": {
+                    "expression": "literal DQR109",
+                    "value": "DQR109",
+                    "provenance": "Mapping-local RuleRef in DQ_GATE_MAP100; corrected XML.",
+                },
+                "failure_reason": {
+                    "expression": "literal descriptive reason for DQR109 failure",
+                    "value": "Email failed DQR109 email-format validation",
+                    "provenance": "Derived from DQR109 RuleExpression and REJECT route.",
+                },
+                "rejected_at": {
+                    "expression": "F.current_timestamp()",
+                    "provenance": "Standard event timestamp for the reject record.",
+                },
+                "source_mapping": {
+                    "expression": "literal mapping name",
+                    "value": "m_customer_360_enrichment",
+                    "provenance": "Selected mapping identity.",
+                },
+            }
+            for target in (llm_input.get("targets", []) or []):
+                if not isinstance(target, dict):
+                    continue
+                physical = str(target.get("physical_table") or "").strip().casefold()
+                if physical.endswith("quality.customer_360_rejects"):
+                    declared_columns = {
+                        str(column.get("name") or column.get("column_name") or "").strip()
+                        if isinstance(column, dict) else str(column).strip()
+                        for column in (target.get("columns") or target.get("ports") or [])
+                    }
+                    required_audit_columns = set(reject_derivations)
+                    if required_audit_columns.issubset(declared_columns) and "DQR109" in mapping_rule_ids:
+                        target["column_derivations"] = reject_derivations
+                        target["column_derivations_provenance"] = (
+                            "Mapping-local DQR109 RuleRef plus explicit MAP100 POC audit-field derivations."
+                        )
+                        target["reject_rule_id"] = "DQR109"
+                        target["reject_route"] = "REJECT"
+                        target["notification_route"] = "NOTIFY"
+
+            llm_input["approved_poc_overrides"] = approved_map100
+
+            # The XML/input builder may have emitted a pre-override blocker saying
+            # these UPSERT targets have no merge keys. That statement is stale only
+            # for the three explicitly approved MAP100 POC targets. Remove that
+            # exact class of blocker after attaching the keys; do not alter XML
+            # metadata or claim the keys are XML-authoritative.
+            approved_targets = {
+                "idmc_poc.curated.customer_gold",
+                "idmc_poc.curated.customer_standard",
+                "idmc_poc.curated.customer_low_value",
+            }
+            retained_blockers = []
+            for blocker in (llm_input.get("blocking_issues", []) or []):
+                message = str(blocker)
+                lower = message.casefold()
+                refers_to_approved_target = any(name in lower for name in approved_targets)
+                is_missing_merge_key_blocker = (
+                    "merge key" in lower
+                    and any(token in lower for token in (
+                        "no merge keys", "does not define merge keys",
+                        "merge keys are not declared", "merge keys are declared",
+                        "without merge keys", "has no merge keys",
+                    ))
+                )
+                if refers_to_approved_target and is_missing_merge_key_blocker:
+                    continue
+                retained_blockers.append(message)
+            llm_input["blocking_issues"] = retained_blockers
+
+            # DQ blockers come from mapping-scoped XML RuleRefs resolved by
+            # LLMInputBuilder. Do not inject repository-level rules that are
+            # not referenced by this mapping's transformations.
+            return
+
+        if normalized_mapping_name != "m_orders_enrichment_scd2":
+            return
+
+        approved = {
+            "mapping_name": "m_orders_enrichment_scd2",
+            "status": "APPROVED_POC_ASSUMPTION",
+            "approved_by_user": True,
+            "assumptions": [
+                {
+                    "transformation": "EXP_NORMALIZE_ORDER",
+                    "field_alias": "business_key",
+                    "source_field": "order_id",
+                    "expression": "UPPER(TRIM(CAST(order_id AS STRING)))",
+                    "purpose": "Resolve the XML expression's undefined business_key reference.",
+                    "provenance": "User-approved POC assumption; not declared by IDMC XML.",
+                },
+                {
+                    "target": "TGT_ORDER_SILVER",
+                    "merge_keys": ["order_id"],
+                    "purpose": "POC MERGE key for the silver orders target.",
+                    "provenance": "User-approved POC assumption; not declared by IDMC XML.",
+                },
+            ],
+        }
+
+        targets = llm_input.get("targets", []) or []
+        matched_target = None
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            names = {
+                str(target.get(key) or "").strip().casefold()
+                for key in ("logical_name", "name", "target", "object", "target_name")
+            }
+            physical = str(target.get("physical_table") or "").strip().casefold()
+            if "tgt_order_silver" in names or physical.endswith(".silver.orders"):
+                matched_target = target
+                break
+
+        if matched_target is not None:
+            matched_target["merge_keys"] = ["order_id"]
+            matched_target["merge_key_provenance"] = "APPROVED_POC_ASSUMPTION"
+            matched_target["merge_key_authoritative_from_xml"] = False
+
+        transformations = llm_input.get("transformations", []) or []
+        matched_transformation = None
+        for transformation in transformations:
+            if not isinstance(transformation, dict):
+                continue
+            name = str(
+                transformation.get("name") or transformation.get("id") or ""
+            ).strip().casefold()
+            if name == "exp_normalize_order":
+                matched_transformation = transformation
+                break
+
+        if matched_transformation is not None:
+            matched_transformation["expression"] = (
+                "UPPER(TRIM(CAST(order_id AS STRING)))"
+            )
+            matched_transformation["expression_source"] = "APPROVED_POC_ASSUMPTION"
+            matched_transformation["approved_poc_expression_override"] = (
+                "UPPER(TRIM(CAST(order_id AS STRING)))"
+            )
+            matched_transformation["approved_poc_expression_override_provenance"] = (
+                "APPROVED_POC_ASSUMPTION; user-approved alias business_key=order_id; "
+                "not declared by IDMC XML."
+            )
+            # Keep a normalized alias for downstream transformations/codegen.
+            matched_transformation["approved_poc_output_alias"] = "normalized_key"
+
+        # The repository declares the logical file source as landing/orders_delta,
+        # but the actual landing asset in this workspace is the orders_delta.csv
+        # directory. Configure the exact observed location and CSV format before
+        # source preflight. Spark can read a directory containing CSV part-files.
+        # This is a workspace-specific source-location override, not an XML fact.
+        orders_source_path = (
+            "/Volumes/idmc_poc/bronze/idmc_files/"
+            "landing/orders_delta.csv"
+        )
+        source_overrides_applied = []
+        for source in (llm_input.get("sources", []) or []):
+            if not isinstance(source, dict):
+                continue
+            source_identifiers = {
+                str(source.get(key) or "").strip().casefold()
+                for key in (
+                    "logical_name", "name", "source", "object",
+                    "source_name", "file_path", "resolved_file_path"
+                )
+            }
+            if any(
+                identifier == "landing/orders_delta"
+                or identifier.endswith("/landing/orders_delta")
+                for identifier in source_identifiers
+                if identifier
+            ):
+                source["file_path"] = orders_source_path
+                source["resolved_file_path"] = orders_source_path
+                source["format"] = "csv"
+                source["file_format"] = "csv"
+                source["source_location_override"] = (
+                    "WORKSPACE_POC_OVERRIDE; observed landing/orders_delta.csv directory"
+                )
+                source_overrides_applied.append(
+                    source.get("logical_name") or source.get("name") or "orders source"
+                )
+
+        approved["source_location_overrides"] = [
+            {
+                "logical_source": name,
+                "path": orders_source_path,
+                "format": "csv",
+                "provenance": (
+                    "Workspace inspection showed landing/orders_delta.csv as a directory; "
+                    "configured as a CSV directory for this POC."
+                ),
+            }
+            for name in source_overrides_applied
+        ]
+
+        llm_input["approved_poc_overrides"] = approved
+
+        # Remove only the exact merge-key blocker for the target we just resolved.
+        # All other blockers remain intact and must still fail closed.
+        blockers = llm_input.get("blocking_issues", []) or []
+        filtered = []
+        for blocker in blockers:
+            text = str(blocker)
+            is_this_target = (
+                matched_target is not None
+                and (
+                    "tgt_order_silver" in text.casefold()
+                    or "silver.orders" in text.casefold()
+                )
+            )
+            is_missing_merge_key = (
+                "merge" in text.casefold()
+                and "merge key" in text.casefold()
+                and ("no merge" in text.casefold() or "without" in text.casefold())
+            )
+            if is_this_target and is_missing_merge_key:
+                continue
+            filtered.append(text)
+        llm_input["blocking_issues"] = filtered
+
+        if self.verbose:
+            print(
+                "Approved POC override applied: "
+                "EXP_NORMALIZE_ORDER.business_key=order_id; "
+                "TGT_ORDER_SILVER merge key=order_id."
+            )
+            if source_overrides_applied:
+                print(
+                    "Orders source override applied: "
+                    f"{orders_source_path} (CSV); matched={source_overrides_applied}"
+                )
+            else:
+                print(
+                    "WARNING: orders source path override did not match a source "
+                    "metadata record; source preflight will remain blocked."
+                )
+            if matched_target is None:
+                print("WARNING: TGT_ORDER_SILVER target instance was not matched; key override recorded but not attached.")
+            if matched_transformation is None:
+                print("WARNING: EXP_NORMALIZE_ORDER was not matched; expression override recorded but not attached.")
 
     def _enrich_target_metadata_from_catalog(self, llm_input):
         """Best-effort target schema enrichment; never fail a mapping because
@@ -2334,6 +2961,124 @@ class MigrationPipeline:
             "llm_result_path": result.get("llm_result_path"),
             "error": result.get("error"),
         }
+
+    def write_migration_report(self, migration_results):
+        """Write an Excel report using actual pipeline outcomes; never infer PASS."""
+        rows = []
+        for result in migration_results or []:
+            validation = result.get("validation") or {}
+            generator_validation = (
+                (result.get("llm_result") or {}).get("validation") or {}
+            )
+            source_preflight = result.get("source_preflight") or {}
+            rows.append({
+                "Mapping": result.get("mapping_name"),
+                "Status": "PASS" if result.get("success") else "FAIL",
+                "Stage": result.get("stage"),
+                "Dry Run": result.get("dry_run", self.dry_run),
+                "Executed": result.get("executed", False),
+                "Final Validator": (
+                    "PASS" if validation.get("valid") else
+                    "FAIL" if validation else "NOT RUN"
+                ),
+                "Generator Validator": (
+                    "PASS" if generator_validation.get("valid") else
+                    "FAIL" if generator_validation else "NOT RUN"
+                ),
+                "Source Preflight": (
+                    "PASS" if source_preflight.get("ready") else
+                    "FAIL" if source_preflight else "NOT RECORDED"
+                ),
+                "Blocking Issues": " | ".join(
+                    str(x) for x in (
+                        result.get("blocking_issues")
+                        or validation.get("errors")
+                        or generator_validation.get("errors")
+                        or []
+                    )
+                ),
+                "Error": str(result.get("error") or ""),
+                "Generated PySpark": str(result.get("generated_pyspark") or ""),
+                "LLM Result": str(result.get("llm_result_path") or ""),
+                "Review ID": str(result.get("review_id") or ""),
+            })
+
+        report_dir = os.path.join(self.output_dir, "reports")
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_path = os.path.join(report_dir, f"migration_report_{timestamp}")
+        json_path = base_path + ".json"
+        csv_path = base_path + ".csv"
+        xlsx_path = base_path + ".xlsx"
+
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle, indent=2, ensure_ascii=False, default=str)
+
+        import csv
+        fieldnames = list(rows[0].keys()) if rows else [
+            "Mapping", "Status", "Stage", "Dry Run", "Executed",
+            "Final Validator", "Generator Validator", "Source Preflight",
+            "Blocking Issues", "Error", "Generated PySpark", "LLM Result",
+            "Review ID",
+        ]
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        report_result = {
+            "json": json_path,
+            "csv": csv_path,
+            "xlsx": None,
+            "row_count": len(rows),
+        }
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Migration Results"
+            sheet.append(fieldnames)
+            for row in rows:
+                sheet.append([row.get(field) for field in fieldnames])
+
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1F4E78")
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for column_cells in sheet.columns:
+                max_length = max(
+                    (len(str(cell.value or "")) for cell in column_cells),
+                    default=10,
+                )
+                width = min(max(max_length + 2, 12), 60)
+                sheet.column_dimensions[
+                    get_column_letter(column_cells[0].column)
+                ].width = width
+            for row_cells in sheet.iter_rows(min_row=2):
+                for cell in row_cells:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+            try:
+                workbook.save(xlsx_path)
+                report_result["xlsx"] = xlsx_path
+            except OSError as exc:
+                report_result["xlsx_error"] = str(exc)
+                print(
+                    "Excel report could not be written to the configured output "
+                    f"location ({exc}). JSON/CSV reports remain available."
+                )
+        except ImportError:
+            print(
+                "openpyxl is unavailable. JSON and CSV reports were created; "
+                "install openpyxl to create the Excel workbook."
+            )
+        return report_result
 
     # FINAL SUMMARY
 

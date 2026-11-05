@@ -96,12 +96,38 @@ class LLMPySparkValidator:
         # Do not let generated comments conceal an unresolved migration requirement.
         existing = set(self.errors)
         for blocker in self.llm_input.get("blocking_issues", []) or []:
-            message = "Metadata blocker: " + str(blocker)
+            blocker_text = str(blocker)
+            if self._is_resolved_approved_poc_merge_key_blocker(blocker_text):
+                continue
+            message = "Metadata blocker: " + blocker_text
             if message not in existing:
                 self.errors.append(message)
                 existing.add(message)
 
         return self._build_result()
+
+    def _is_resolved_approved_poc_merge_key_blocker(self, blocker_text):
+        """Ignore only stale missing-key blockers superseded by explicit POC approval."""
+        text = str(blocker_text or "").casefold()
+        if "merge key" not in text:
+            return False
+        missing_key_language = any(token in text for token in (
+            "no merge keys", "does not define merge keys",
+            "merge keys are not declared", "without merge keys",
+            "has no merge keys", "uses upsert but no merge keys",
+        ))
+        if not missing_key_language:
+            return False
+        override = self.llm_input.get("approved_poc_overrides", {})
+        if not isinstance(override, dict) or override.get("approved_by_user") is not True:
+            return False
+        if str(override.get("mapping_name") or "").casefold() != "m_customer_360_enrichment":
+            return False
+        approved_names = set()
+        for assumption in override.get("assumptions", []) or []:
+            if isinstance(assumption, dict):
+                approved_names.update(str(name).casefold() for name in (assumption.get("targets", []) or []))
+        return any(name in text for name in approved_names)
 
     # ============================================================
     # PYTHON SYNTAX
@@ -202,7 +228,12 @@ class LLMPySparkValidator:
                 )
 
     def _resolve_file_path(self, source):
-        path = source.get("file_path") or source.get("path")
+        # InputBuilder resolves relative XML paths once; prefer its absolute path.
+        path = (
+            source.get("resolved_file_path")
+            or source.get("file_path")
+            or source.get("path")
+        )
         if not isinstance(path, str) or not path.strip():
             return None
         path = path.strip()
@@ -278,11 +309,6 @@ class LLMPySparkValidator:
                     reader = self.spark.read.format(file_format)
                     options = source.get("options", {})
                     options = dict(options) if isinstance(options, dict) else {}
-                    # Match the Customer360 CSV contract verified by the user.
-                    # Metadata-provided values always win; other formats are untouched.
-                    if file_format.lower() == "csv":
-                        options.setdefault("header", "true")
-                        options.setdefault("inferSchema", "true")
                     for key, value in options.items():
                         if key != "format":
                             reader = reader.option(str(key), str(value))
@@ -410,9 +436,16 @@ class LLMPySparkValidator:
 
             if operation in {"UPSERT", "MERGE"}:
                 key_status = self._target_merge_key_status(target)
-                unapproved_key_status = key_status in {"POC_ASSUMPTION", "ASSUMED", "UNVERIFIED", "UNKNOWN"}
-                has_merge_keys = self._target_has_merge_keys(target) and not unapproved_key_status
-
+                unapproved_key_status = key_status in {
+                    "POC_ASSUMPTION", "ASSUMED", "UNVERIFIED", "UNKNOWN"
+                }
+                approved_poc_key_status = key_status == "APPROVED_POC_ASSUMPTION"
+                has_merge_keys = (
+                    self._target_has_merge_keys(target)
+                    and (not unapproved_key_status)
+                    and (key_status != "APPROVED_POC_ASSUMPTION" or approved_poc_key_status)
+                )
+                
                 if unapproved_key_status:
                     if physical_table in generated_merge_targets:
                         self.errors.append(
@@ -966,10 +999,20 @@ class LLMPySparkValidator:
                     seen.add(message)
 
     def _validate_transformations(self):
-        transformations = self.llm_input.get("transformations", [])
-        executable_code = self._code_without_comments()
-        code_lower = executable_code.lower()
+        """Validate that generated code contains enough operations for declared nodes.
 
+        This is deliberately a static structural check, not proof of semantic
+        equivalence. Counts are checked by transformation type so one join cannot
+        silently satisfy several unrelated LOOKUP/JOINER nodes.
+        """
+        transformations = self.llm_input.get("transformations", [])
+        if isinstance(transformations, dict):
+            transformations = list(transformations.values())
+        if not isinstance(transformations, list):
+            transformations = []
+
+        code = self._code_without_comments()
+        code_lower = code.lower()
         placeholder_patterns = (
             "not implemented", "todo:", "todo(", "placeholder",
             "pass through unchanged", "passing through unchanged",
@@ -981,78 +1024,80 @@ class LLMPySparkValidator:
                     f"Executable code contains incomplete/placeholder logic: '{marker}'."
                 )
 
-        # Match blockers to the named transformation where possible. Do not
-        # use a global placeholder word elsewhere in the file to classify a
-        # DATAQUALITY transformation as a pass-through.
-        blocked_lines = [
-            line.lower() for line in self.generated_code.splitlines()
-            if re.search(r"^\s*#\s*BLOCKED\s*:", line, re.IGNORECASE)
-        ]
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return
 
+        method_counts = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                method = node.func.attr.casefold()
+                method_counts[method] = method_counts.get(method, 0) + 1
+
+        # Normalize parser variants (e.g. Joiner, JOINER, JoinerTransformation).
+        aliases = {
+            "filter": {"filter", "where"},
+            "joiner": {"join"},
+            "lookup": {"join"},
+            "aggregator": {"groupby"},
+            "expression": {"withcolumn", "selectexpr"},
+            "router": {"filter", "where"},
+            "dataquality": {"withcolumn", "filter", "where", "select", "selectexpr"},
+            "storedprocedure": {"call", "sql", "saveastable"},
+            "sorter": {"orderBy", "sort"},
+            "rank": {"withcolumn", "select"},
+            "union": {"union", "unionByName"},
+            "distinct": {"distinct", "dropDuplicates"},
+            "sequence": {"withcolumn", "select"},
+        }
+        required_by_type = {}
+        display_by_type = {}
         for transformation in transformations:
             if not isinstance(transformation, dict):
                 continue
-            transformation_type = str(transformation.get("type", "")).upper()
-            transformation_name = str(transformation.get("name") or "UNKNOWN")
-            name_lower = transformation_name.lower()
+            raw_type = str(
+                transformation.get("type")
+                or transformation.get("transformation_type")
+                or transformation.get("name")
+                or ""
+            )
+            normalized = re.sub(r"[^a-z]", "", raw_type.casefold())
+            if normalized.endswith("transformation"):
+                normalized = normalized[:-14]
+            if normalized not in aliases:
+                continue
+            required_by_type[normalized] = required_by_type.get(normalized, 0) + 1
+            display_by_type.setdefault(normalized, []).append(
+                str(transformation.get("name") or raw_type or "UNKNOWN")
+            )
 
-            if transformation_type == "FILTER":
-                if ".filter(" not in executable_code and ".where(" not in executable_code:
-                    self.errors.append(
-                        f"FILTER transformation '{transformation_name}' has no filter/where operation."
-                    )
-            elif transformation_type == "JOINER":
-                if ".join(" not in executable_code:
-                    self.errors.append(
-                        f"JOINER transformation '{transformation_name}' has no join operation."
-                    )
-            elif transformation_type == "LOOKUP":
-                if ".join(" not in executable_code and "broadcast(" not in executable_code:
-                    self.errors.append(
-                        f"LOOKUP transformation '{transformation_name}' has no lookup/join operation."
-                    )
-            elif transformation_type == "AGGREGATOR":
-                if ".groupBy(" not in executable_code and ".groupby(" not in executable_code:
-                    self.errors.append(
-                        f"AGGREGATOR transformation '{transformation_name}' has no groupBy operation."
-                    )
-            elif transformation_type == "EXPRESSION":
-                if ".withColumn(" not in executable_code and "selectExpr(" not in executable_code:
-                    self.errors.append(
-                        f"EXPRESSION transformation '{transformation_name}' has no withColumn/selectExpr operation."
-                    )
-            elif transformation_type == "ROUTER":
-                if ".filter(" not in executable_code and ".where(" not in executable_code:
-                    self.errors.append(
-                        f"ROUTER transformation '{transformation_name}' has no visible routing filters."
-                    )
-            elif transformation_type == "DATAQUALITY":
-                named_blocker = any(
-                    name_lower in line for line in blocked_lines
+        for transformation_type, required_count in required_by_type.items():
+            accepted_methods = aliases[transformation_type]
+            actual_count = sum(method_counts.get(method.casefold(), 0) for method in accepted_methods)
+            if actual_count < required_count:
+                names = ", ".join(display_by_type.get(transformation_type, []))
+                self.errors.append(
+                    f"Transformation coverage: {required_count} {transformation_type.upper()} "
+                    f"node(s) ({names}) were declared, but only {actual_count} matching "
+                    "PySpark operation(s) were detected. Review each node's implementation."
                 )
-                if named_blocker:
-                    self.errors.append(
-                        f"DATAQUALITY transformation '{transformation_name}' is explicitly blocked by missing or ambiguous metadata."
-                    )
-                elif not any(
-                    token in executable_code
-                    for token in (".withColumn(", ".filter(", ".where(", ".select(")
-                ):
-                    self.errors.append(
-                        f"DATAQUALITY transformation '{transformation_name}' has no executable data-quality operation."
-                    )
-            elif transformation_type == "STORED_PROCEDURE":
-                if "spark" not in executable_code:
-                    self.errors.append(
-                        f"STORED_PROCEDURE transformation '{transformation_name}' has no Spark implementation."
-                    )
+
+        # Explicit BLOCKED comments remain a hard failure, but only when the
+        # comment names a known transformation (or declares a general blocker).
+        blocked_lines = [
+            line.strip() for line in self.generated_code.splitlines()
+            if re.search(r"^\s*#\s*BLOCKED\s*:", line, re.IGNORECASE)
+        ]
+        for line in blocked_lines:
+            self.errors.append("Generated code contains an explicit blocker: " + line.lstrip("# "))
 
     # ============================================================
     # MAPPING-AWARE SEMANTIC SAFETY
     # ============================================================
 
     def _validate_semantic_safety(self):
-        """Catch high-risk semantics that syntax and keyword checks cannot prove."""
+        """Apply metadata-driven safeguards without mapping-specific column names."""
         transformations = self.llm_input.get("transformations", [])
         if isinstance(transformations, dict):
             transformations = list(transformations.values())
@@ -1064,70 +1109,113 @@ class LLMPySparkValidator:
         code = self._code_without_comments()
 
         sequence_nodes = [
-            t for t in transformations
-            if isinstance(t, dict) and "sequence" in str(t.get("type", t.get("name", ""))).casefold()
+            item for item in transformations
+            if isinstance(item, dict)
+            and "sequence" in str(
+                item.get("type") or item.get("transformation_type") or item.get("name") or ""
+            ).casefold()
         ]
-        has_upsert_target = any(
-            isinstance(t, dict) and str(t.get("operation", "")).upper() in {"UPSERT", "MERGE"}
-            for t in targets
-        )
-        if sequence_nodes and has_upsert_target and re.search(
+        upsert_targets = [
+            item for item in targets
+            if isinstance(item, dict)
+            and str(item.get("operation", "")).upper() in {"UPSERT", "MERGE"}
+        ]
+        if sequence_nodes and upsert_targets and re.search(
             r"\b(row_number|monotonically_increasing_id)\s*\(", code, re.I
         ):
-            # Reusing existing keys must be explicit. Merely mentioning a
-            # surrogate-key column is not enough to establish persistence.
-            persistent_reuse = (
-                bool(re.search(r"DeltaTable\.forName\s*\(", code))
-                and bool(re.search(r"customer_sk", code, re.I))
-                and bool(re.search(r"left_anti|leftanti|existing.*customer_sk|customer_sk.*existing", code, re.I | re.S))
-            )
-            if not persistent_reuse:
-                names = ", ".join(str(t.get("name", "Sequence")) for t in sequence_nodes)
-                self.errors.append(
-                    "Semantic safety: sequence transformation(s) " + names +
-                    " feed an UPSERT/MERGE mapping, but generated code allocates keys without "
-                    "demonstrating reuse of existing surrogate keys by business key."
-                )
-
-        gate_nodes = [
-            t for t in transformations
-            if isinstance(t, dict) and "gate" in str(t.get("name", "")).casefold()
-        ]
-        if gate_nodes:
-            try:
-                tree = ast.parse(code)
-                status_columns = set(re.findall(
-                    r"withColumn\s*\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", code
-                ))
-                status_columns = {
-                    name for name in status_columns
-                    if "dq_status" in name.casefold() or "quality_status" in name.casefold()
-                }
-                consumed, persisted = set(), set()
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    method_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
-                    segment = ast.get_source_segment(code, node) or ""
-                    if method_name in {"filter", "where", "when", "otherwise"}:
-                        consumed.update(name for name in status_columns if name in segment)
-                    if method_name in {"select", "selectExpr", "withColumn"}:
-                        # withColumn alone only creates the status; it does not
-                        # prove a downstream disposition. Count only an explicit
-                        # select/persisted target column as a persisted output.
-                        if method_name in {"select", "selectExpr"}:
-                            persisted.update(name for name in status_columns if name in segment)
-                unused = status_columns - consumed - persisted
-                if unused:
+            for target in upsert_targets:
+                target_name = target.get("physical_table") or target.get("logical_name") or "UNKNOWN"
+                merge_keys = target.get("merge_keys") or target.get("key_columns") or []
+                if isinstance(merge_keys, str):
+                    merge_keys = [part.strip() for part in re.split(r"[,;|]", merge_keys) if part.strip()]
+                if not merge_keys and self._target_merge_key_status(target) != "APPROVED_POC_ASSUMPTION":
                     self.errors.append(
-                        "Semantic safety: DataQuality gate transformation(s) " +
-                        ", ".join(str(t.get("name", "UNKNOWN")) for t in gate_nodes) +
-                        " create status column(s) " + ", ".join(sorted(unused)) +
-                        " without using them for a disposition or persisting them in output."
+                        f"Semantic safety: sequence-generated key feeds UPSERT/MERGE target "
+                        f"'{target_name}', but authoritative merge keys are missing."
                     )
-            except SyntaxError:
-                # Syntax validation already reports the underlying issue.
-                pass
+                    continue
+
+                # Sequence output field must come from the transformation metadata
+                # (ports/output fields/attributes), never from a fixed column name.
+                sequence_fields = set()
+                for node in sequence_nodes:
+                    for key in ("sequence_field", "output_field", "surrogate_key", "field_name"):
+                        value = node.get(key)
+                        if isinstance(value, str) and value.strip():
+                            sequence_fields.add(value.strip())
+                    for collection_key in ("ports", "output_ports", "fields", "xml_metadata"):
+                        value = node.get(collection_key)
+                        sequence_fields.update(self._collect_field_names(value))
+                if not sequence_fields:
+                    self.errors.append(
+                        "Semantic safety: sequence transformation feeds an UPSERT/MERGE, "
+                        "but its generated key field is not explicitly identified in metadata."
+                    )
+                    continue
+
+                key_pattern = "|".join(re.escape(key) for key in sorted(sequence_fields, key=len, reverse=True))
+                business_keys = {
+                    str(node.get("business_key")).strip()
+                    for node in sequence_nodes
+                    if isinstance(node.get("business_key"), str) and node.get("business_key").strip()
+                }
+                has_existing_key_lookup = bool(
+                    re.search(r"spark\.table\s*\(", code)
+                    and re.search(key_pattern, code, re.I)
+                    and re.search(r"\b(existing|matched|target|current)\b", code, re.I)
+                    and re.search(r"\.join\s*\(", code)
+                    and re.search(r"how\s*=\s*['\"]left['\"]|,\s*['\"]left['\"]\s*\)", code, re.I)
+                    and re.search(r"\b(coalesce|when)\s*\(", code, re.I)
+                    and re.search(r"\b(isNull|isNotNull|isnull|isnotnull)\s*\(", code, re.I)
+                    and re.search(r"\.(filter|where)\s*\(", code, re.I)
+                    and (not business_keys or all(re.search(rf"\b{re.escape(key)}\b", code) for key in business_keys))
+                )
+                if not has_existing_key_lookup:
+                    self.errors.append(
+                        f"Semantic safety: sequence transformation(s) feed UPSERT/MERGE target "
+                        f"'{target_name}', but code does not demonstrate reuse of existing "
+                        "surrogate keys before allocating new ones."
+                    )
+
+        # DQ handling is only enforceable when XML supplies a disposition/action.
+        # Do not assume a particular status-column naming convention or that every
+        # quality rule must filter rows; preserve the exact rule metadata for review.
+        for node in transformations:
+            if not isinstance(node, dict):
+                continue
+            node_type = str(node.get("type") or node.get("transformation_type") or "").casefold()
+            if "dataquality" not in node_type and node_type not in {"dq", "quality"}:
+                continue
+            rules = node.get("data_quality_rules") or []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                action = str(
+                    rule.get("failure_action") or rule.get("action")
+                    or rule.get("disposition") or ""
+                ).strip().casefold()
+                if action in {"reject", "quarantine", "discard", "filter", "drop"}:
+                    # Require some row-disposition operation, but don't guess the
+                    # rule's output status column or exact expression.
+                    if not any(token in code for token in (".filter(", ".where(", ".join(")):
+                        self.errors.append(
+                            f"Semantic safety: DQ rule '{rule.get('name') or rule.get('id') or 'UNKNOWN'}' "
+                            f"requires '{action}' disposition, but no corresponding filtering/join "
+                            "operation was detected."
+                        )
+
+    @classmethod
+    def _collect_field_names(cls, value):
+        names = set()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"name", "field_name", "column_name", "port_name"} and isinstance(item, str):
+                    names.add(item)
+                names.update(cls._collect_field_names(item))
+        elif isinstance(value, list):
+            for item in value:
+                names.update(cls._collect_field_names(item))
+        return names
 
     # ============================================================
     # DANGEROUS OPERATION VALIDATION

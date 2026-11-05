@@ -287,48 +287,133 @@ class LLMGenerator:
 
     @staticmethod
     def _semantic_guard_errors(code, llm_input):
-        """Reject high-risk generated patterns missed by syntax-only validation."""
+        """Reject unsafe sequence-key and unused-DQ-gate patterns using mapping metadata."""
         errors = []
         if not isinstance(code, str) or not isinstance(llm_input, dict):
             return errors
+
+        errors.extend(LLMGenerator._source_contract_errors(code, llm_input))
+
         transformations = llm_input.get("transformations", [])
         if isinstance(transformations, dict):
             transformations = list(transformations.values())
         if not isinstance(transformations, list):
             transformations = []
+
         targets = llm_input.get("targets", [])
         if not isinstance(targets, list):
             targets = []
-        sequence_nodes = [item for item in transformations if isinstance(item, dict) and
-                          "sequence" in str(item.get("type", item.get("name", ""))).casefold()]
-        has_upsert_target = any(isinstance(target, dict) and
-                                str(target.get("operation", "")).upper() in {"UPSERT", "MERGE"}
-                                for target in targets)
-        if sequence_nodes and has_upsert_target and re.search(
-                r"\b(row_number|monotonically_increasing_id)\s*\(", code):
-            # Permit row_number only as an allocator for NEW keys when existing
-            # surrogate keys are looked up and reused for matching business keys.
-            has_persistent_allocator = (
-                bool(re.search(r"DeltaTable\.forName\s*\(", code))
-                and bool(re.search(r"max\s*\(\s*['\"]customer_sk['\"]", code))
-                and bool(re.search(r"customer_sk", code))
-                and bool(re.search(r"left_anti|leftanti|existing.*customer_sk|customer_sk.*existing", code, re.I | re.S))
+
+        sequence_nodes = [
+            item for item in transformations
+            if isinstance(item, dict)
+            and "sequence" in str(
+                item.get("type") or item.get("transformation_type")
+                or item.get("name") or ""
+            ).casefold()
+        ]
+        merge_targets = [
+            target for target in targets
+            if isinstance(target, dict)
+            and str(target.get("operation") or "").upper() in {"UPSERT", "MERGE"}
+        ]
+
+        if sequence_nodes and merge_targets and re.search(
+            r"\b(row_number|monotonically_increasing_id)\s*\(", code
+        ):
+            # Derive possible generated key names from the sequence node and target
+            # metadata. Do not assume a particular customer's surrogate-key column.
+            candidate_keys = set()
+            for node in sequence_nodes:
+                for container in (
+                    node,
+                    node.get("details", {}),
+                    node.get("ports", []),
+                    node.get("xml_metadata", {}),
+                ):
+                    if isinstance(container, dict):
+                        for key in ("name", "field", "column", "outputField", "portName", "sequence_field", "output_field", "business_key"):
+                            value = container.get(key)
+                            if isinstance(value, str) and value.strip():
+                                candidate_keys.add(value.strip())
+                    elif isinstance(container, list):
+                        for item in container:
+                            if isinstance(item, dict):
+                                for key in ("name", "field", "column", "outputField", "portName"):
+                                    value = item.get(key)
+                                    if isinstance(value, str) and value.strip():
+                                        candidate_keys.add(value.strip())
+            for target in merge_targets:
+                for column in target.get("columns", []) or []:
+                    if isinstance(column, dict):
+                        name = column.get("name") or column.get("column")
+                        if name and any(
+                            token in str(name).casefold()
+                            for token in ("surrogate", "sequence", "generated", "_sk", "key")
+                        ):
+                            candidate_keys.add(str(name))
+            candidate_keys = {key for key in candidate_keys if key}
+
+            # Existing surrogate-key preservation can be implemented with a
+            # left join to spark.table(target).select(business_key, sequence_key),
+            # followed by coalesce(existing_key, newly_allocated_key). Requiring
+            # left_anti specifically rejected this valid and common pattern.
+            business_keys = {
+                str(node.get("business_key")).strip()
+                for node in sequence_nodes
+                if isinstance(node.get("business_key"), str) and node.get("business_key").strip()
+            }
+            persistent_lookup = (
+                bool(re.search(r"spark\.table\s*\(", code))
+                and bool(re.search(r"\b(existing|matched|target|current)\b", code, re.I))
+                and bool(candidate_keys)
+                and any(re.search(rf"\b{re.escape(key)}\b", code) for key in candidate_keys)
+                and bool(re.search(r"\.join\s*\(", code))
+                and bool(re.search(r"how\s*=\s*['\"]left['\"]|,\s*['\"]left['\"]\s*\)", code, re.I))
+                and bool(re.search(r"\b(coalesce|when)\s*\(", code, re.I))
+                and bool(re.search(r"\b(isNull|isNotNull|isnull|isnotnull)\s*\(", code, re.I))
+                and bool(re.search(r"\.(filter|where)\s*\(", code, re.I))
+                and (not business_keys or all(re.search(rf"\b{re.escape(key)}\b", code) for key in business_keys))
             )
-            if not has_persistent_allocator:
-                names = ", ".join(str(item.get("name", "Sequence")) for item in sequence_nodes)
-                errors.append("Semantic safety: sequence transformation(s) " + names +
-                              " feed an UPSERT mapping, but generated code assigns a fresh row_number/"
-                              "monotonically_increasing_id instead of preserving existing surrogate keys. "
-                              "Reuse existing customer_sk by business key and allocate keys only for new IDs; "
-                              "otherwise report a blocking metadata gap.")
-        gate_nodes = [item for item in transformations if isinstance(item, dict) and
-                      "gate" in str(item.get("name", "")).casefold()]
+            if not persistent_lookup:
+                names = ", ".join(
+                    str(item.get("name") or item.get("id") or "Sequence")
+                    for item in sequence_nodes
+                )
+                errors.append(
+                    "Semantic safety: sequence transformation(s) "
+                    + names
+                    + " feed an UPSERT/MERGE target, but generated code appears to "
+                    "allocate identifiers without demonstrably reusing existing "
+                    "target keys for matching business keys. Identify the sequence "
+                    "output key from XML, preserve existing values by the declared "
+                    "business key, allocate only for new records, or block the write "
+                    "if the required key metadata is unavailable."
+                )
+
+        gate_nodes = [
+            item for item in transformations
+            if isinstance(item, dict)
+            and (
+                "gate" in str(item.get("name") or "").casefold()
+                or "dataquality" in str(
+                    item.get("type") or item.get("transformation_type") or ""
+                ).casefold()
+            )
+        ]
         if gate_nodes:
             try:
                 tree = ast.parse(code)
-                column_names = set(re.findall(r"withColumn\s*\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", code))
-                gate_columns = {name for name in column_names if
-                                "dq_status" in name.casefold() or "quality_status" in name.casefold()}
+                status_columns = set(
+                    re.findall(
+                        r"withColumn\s*\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]",
+                        code,
+                    )
+                )
+                status_columns = {
+                    name for name in status_columns
+                    if any(token in name.casefold() for token in ("dq_status", "quality_status", "dq_result"))
+                }
                 consumed, persisted = set(), set()
                 for node in ast.walk(tree):
                     if not isinstance(node, ast.Call):
@@ -336,17 +421,20 @@ class LLMGenerator:
                     method_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
                     segment = ast.get_source_segment(code, node) or ""
                     if method_name in {"filter", "where", "when", "otherwise"}:
-                        consumed.update(name for name in gate_columns if name in segment)
-                    if method_name == "select":
-                        persisted.update(name for name in gate_columns if name in segment)
-                unused = gate_columns - consumed - persisted
+                        consumed.update(name for name in status_columns if name in segment)
+                    if method_name in {"select", "selectExpr", "withColumn"}:
+                        persisted.update(name for name in status_columns if name in segment)
+                unused = status_columns - consumed - persisted
                 if unused:
-                    errors.append("Semantic safety: DataQuality gate transformation(s) " +
-                                  ", ".join(str(item.get("name")) for item in gate_nodes) +
-                                  " produce status column(s) " + ", ".join(sorted(unused)) +
-                                  " that do not control downstream filtering/routing and are not persisted. "
-                                  "Follow the XML-defined disposition; if reject/quarantine/pass-through "
-                                  "behavior is not specified, report a blocking metadata gap instead of inventing one.")
+                    errors.append(
+                        "Semantic safety: data-quality transformation(s) "
+                        + ", ".join(str(item.get("name") or item.get("id") or "DQ node") for item in gate_nodes)
+                        + " produce status column(s) "
+                        + ", ".join(sorted(unused))
+                        + " that are neither used to control downstream flow nor "
+                        "persisted. Follow the XML-defined disposition; if it is "
+                        "not specified, block the mapping rather than inventing one."
+                    )
             except SyntaxError:
                 pass
         return errors
@@ -437,17 +525,20 @@ EXACT TARGET NAME RULE — CRITICAL:
 - For this request, the selected target metadata is:
   {json.dumps(target, ensure_ascii=False, separators=(',', ':'), default=str)}
 - Use the exact physical_table string from that metadata in DeltaTable.forName(spark, ...).
-- Never shorten a three-part name such as "idmc_poc.curated.customer_low_value"
-  to "curated.customer_low_value" or change its catalog/schema/table components.
+- Never shorten a three-part catalog.schema.table identifier to schema.table or change its components.
 - A target-name variable is allowed only if its assigned string equals physical_table exactly.
 - Before returning code, compare the DeltaTable.forName target name with physical_table character-for-character.
+- If selected target metadata has column_derivations, implement those exact derivations. For customer_360_rejects, construct the six-column reject DataFrame using the supplied DQR109 literal/reason/timestamp/mapping derivations and append to the exact target. Never leave the write commented out.
+- For notification_outbox, use the NOTIFY graph branch, not the REJECT branch, and implement all declared target columns.
 - Do not hide writes in generic helper functions or pass target names through parameters. Emit the
   target-specific DeltaTable.forName(...).alias("t").merge(...) chain directly in the required function.
 - Treat merge_key_status values exactly POC_ASSUMPTION, ASSUMED, UNVERIFIED, or UNKNOWN as unapproved. APPROVED_POC_ASSUMPTION is allowed only for this POC, must be disclosed as an assumption, and must not be described as authoritative.
 - Do not use Column '+' for string concatenation; use F.concat/F.concat_ws when metadata supports it.
 - Never assign a fresh row_number() to every UPSERT row. For a declared Sequence transformation, preserve existing keys by business key and allocate sequence values only for new keys using existing persistent target key values; otherwise block writes.
-- A DQ gate cannot be a calculated-but-unused status column. For this POC, if the XML defines a gate and no quarantine target exists, filter out rows failing the supplied gate rules, count rejected rows, and disclose this disposition as a POC assumption.
-- For outer-join metrics used by this customer segmentation router, treat missing order metrics as zero as an explicit POC assumption, while preserving XML router thresholds.
+- A DQ gate cannot be a calculated-but-unused status column. Follow the XML-defined disposition; if no disposition is defined, report a blocking metadata gap rather than inventing one.
+- MAP100 REJECT TARGET: when target metadata includes column_derivations, implement EVERY declared derivation exactly and write the reject DataFrame to the exact physical_table. For idmc_poc.quality.customer_360_rejects, use the DQ_GATE_MAP100 REJECT branch (DQR109 only): customer_id and email from the failed rows; dq_rule_id from the supplied literal DQR109; failure_reason from the supplied descriptive literal; rejected_at from F.current_timestamp(); source_mapping from the supplied mapping-name literal. Select/cast all six declared target columns and call .write.format("delta").mode("append").saveAsTable("idmc_poc.quality.customer_360_rejects"). Do not leave this write commented out and do not describe these supplied derivations as missing metadata.
+- MAP100 NOTIFICATION: route notification rows only from the DQ_GATE_MAP100 NOTIFY output, not by reusing the REJECT DataFrame unless the graph explicitly connects those branches. Build all declared notification_outbox columns and append to its exact physical_table.
+- Preserve XML-defined null handling for outer joins and routing. Do not coalesce missing values unless the XML or an explicitly approved mapping assumption specifies that behavior.
 - Validate uniqueness of lookup keys and source merge keys before target writes; fail closed on duplicates.
 
 For UPSERT/MERGE with approved keys, call .merge(...) only on DeltaTable.forName(spark, exact_physical_table),
@@ -611,6 +702,7 @@ NORMALIZED MAPPING CONTEXT (JSON):
             "targets", "links", "data_quality_rules", "xml_mapping_metadata",
             "blocking_issues", "databricks", "runtime_parameters",
             "parameters", "mapping_task", "mapping_task_metadata",
+            "approved_poc_overrides", "source_preflight", "csv_defaults",
         )
         compact = {key: llm_input[key] for key in allowed if key in llm_input}
 
@@ -673,11 +765,32 @@ NORMALIZED MAPPING CONTEXT (JSON):
 
         if mode == "code":
             prompt += (
+                "\nPOC CONTRACTS (USE THESE ONLY WHEN PRESENT IN THE INPUT): "
+                "approved_poc_overrides and source_preflight are retained evidence. "
+                "For MAP100, use customer_id as the approved POC merge key for all three "
+                "Customer 360 targets; use the SEQ_CUSTOMER_SK metadata (customer_sk, start "
+                "100000, increment 1) to populate customer_sk once before routing. Preserve "
+                "existing customer_sk values for matched customer_id values by checking all "
+                "three existing target tables, reject conflicting keys/duplicate customer_id "
+                "values, and allocate new values only to genuinely new customer_id values. "
+                "Do not omit the three explicit Delta MERGE statements merely because the keys "
+                "are APPROVED_POC_ASSUMPTION; keep the write section behind a false-by-default "
+                "execution flag. Apply only DQ rules referenced by this mapping RuleRef elements. "
+                "For MAP101, read the orders CSV from the exact resolved_file_path and honor "
+                "its effective CSV options. Do not invent missing target schemas or unresolved "
+                "join/lookup/DQ semantics.\n"
                 "\nFINAL OVERRIDE: This is the CODE phase. Output only mapping_name, "
                 "assumptions_or_gaps, and pyspark_code. Do not include plan or summary "
-                "fields. The supplied blocking_issues are authoritative. If unresolved "
-                "merge keys or other blockers exist, do not write those targets and "
-                "record the blockers.\n"
+                "fields. The supplied blocking_issues are authoritative AFTER pipeline "
+                "override normalization. For MAP100, approved_poc_overrides.approved_by_user=true "
+                "explicitly authorizes customer_id as a POC merge key for the three named "
+                "targets; this is not XML-authoritative. Do not re-classify those supplied "
+                "keys as missing or unapproved. Generate explicit Delta MERGE code for all "
+                "three targets using only customer_id, but keep execution gated while any "
+                "other blocker remains. For data quality, use only RuleRef IDs present "
+                "inside the selected mapping's transformation XML and their matching "
+                "rule definitions. Ignore repository-level rules not referenced by this "
+                "mapping. Preserve XML-defined DQ routes and declared reject/outbox targets.\n"
             )
         else:
             prompt += (
@@ -685,7 +798,7 @@ NORMALIZED MAPPING CONTEXT (JSON):
                 "migration_plan, transformation_logic, and assumptions_or_gaps. Never "
                 "include PySpark source code or code snippets. Do not invent semantics.\n"
             )
-        prompt += '\n\nTARGET WRITE SAFETY AND TRANSFORMATION COVERAGE CONTRACT:\n- Emit complete Python source with one clearly named top-level migration function. Do not emit\n  disconnected snippets, pseudocode, placeholder functions, or target-write shells.\n- Read every declared source using its exact physical_table or resolved file path. Build the\n  transformation DataFrames in graph dependency order and preserve the required row grain.\n- For EVERY transformation node, implement the supplied expression, filter, lookup/join,\n  aggregation, routing, or DQ rule in executable code, OR report the precise missing metadata\n  as a blocker. Do not satisfy coverage with an unrelated operation elsewhere in the script.\n- Follow graph links and input/output ports to determine which DataFrame feeds each node and target.\n  Do not invent expressions, columns, route thresholds, merge keys, or target schemas.\n- For every target, emit its declared write when metadata is sufficient. If metadata is insufficient,\n  explicitly block that target and report the exact gap; do not silently omit it or claim success.\n- Never hide target writes inside a generic helper or pass target names through function parameters.\n  Emit each target write explicitly with its exact physical_table string for static validation. For MAP100 the target literals are idmc_poc.curated.customer_gold, idmc_poc.curated.customer_standard, and idmc_poc.curated.customer_low_value; all three require an explicit DeltaTable.forName(...).merge(...).execute() statement.\n- MERGE KEY STATUS: use only supplied merge_keys. A status exactly POC_ASSUMPTION, ASSUMED, UNVERIFIED, or UNKNOWN is not approved. APPROVED_POC_ASSUMPTION is permitted for this POC because the supplied XML explicitly marks it approved; record it as a POC assumption and keep actual execution disabled until verified. Never claim it is authoritative.\n- For every UPSERT/MERGE target with supplied keys and an allowed status, emit an explicit DeltaTable.forName(spark, exact_physical_table).alias("t").merge(source_df.alias("s"), predicate_from_only_supplied_keys).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(). Keep the exact target table literal visible in the code. Never substitute append/overwrite or omit a target.\n- Use F.concat/F.concat_ws for supported string concatenation; preserve supplied null semantics.\n- SEQUENCE SAFETY: when a Sequence node declares startValue/incrementBy and the mapping UPSERTs by a business key, preserve existing customer_sk for existing business keys by reading current keys from declared target tables. Allocate keys only for new IDs, starting at max(existing customer_sk)+incrementBy, in deterministic business-key order. Detect duplicate business keys and conflicting existing surrogate keys before writes. This allocator assumes a single-writer POC; document that concurrent runs require a transactional central sequence/key registry. Never assign a fresh row_number to every row. If reliable existing-key lookup is impossible, block writes and explain why.\n- DATA-QUALITY GATES: implement exact XML rules and ensure DQ result controls downstream flow. If XML defines a DQ gate but no quarantine target exists, for this POC treat the gate as a pass filter, count/report rejected rows, and disclose this disposition as a POC assumption in assumptions_or_gaps. Do not calculate dq_status and ignore it. Persist DQ status only if target schema supports it.\n- NULL / ROUTING SAFETY: for this customer segmentation POC, treat missing order metrics from the left join as zero before applying the declared router thresholds, and disclose this as a POC assumption. Do not change XML thresholds.\n- LOOKUP / MERGE SAFETY: validate lookup-key uniqueness and source uniqueness for MERGE keys before writes; fail closed on duplicates.\n- A syntactically valid script is not enough: do not claim success if any transformation or target\n  is missing, metadata blockers remain, or validation fails.\n'
+        prompt += '\n\nTARGET WRITE SAFETY AND TRANSFORMATION COVERAGE CONTRACT:\n- Emit complete Python source with one clearly named top-level migration function. Do not emit\n  disconnected snippets, pseudocode, placeholder functions, or target-write shells.\n- Read every declared source using its exact physical_table or resolved file path. Build the\n  transformation DataFrames in graph dependency order and preserve the required row grain.\n- For EVERY transformation node, implement the supplied expression, filter, lookup/join,\n  aggregation, routing, or DQ rule in executable code, OR report the precise missing metadata\n  as a blocker. Do not satisfy coverage with an unrelated operation elsewhere in the script.\n- Follow graph links and input/output ports to determine which DataFrame feeds each node and target.\n  Do not invent expressions, columns, route thresholds, merge keys, or target schemas.\n- For every target, emit its declared write when metadata is sufficient. If metadata is insufficient,\n  explicitly block that target and report the exact gap; do not silently omit it or claim success.\n- Never hide target writes inside a generic helper or pass target names through function parameters.\n  Emit each target write explicitly with its exact physical_table string for static validation. For MAP100 the target literals are idmc_poc.curated.customer_gold, idmc_poc.curated.customer_standard, and idmc_poc.curated.customer_low_value; all three require an explicit DeltaTable.forName(...).merge(...).execute() statement.\n- MERGE KEY STATUS: use only supplied merge_keys. A status exactly POC_ASSUMPTION, ASSUMED, UNVERIFIED, or UNKNOWN is not approved. APPROVED_POC_ASSUMPTION is permitted only when approved_poc_overrides.approved_by_user is true for this mapping; it is a user-approved POC assumption, not an XML fact. Keep actual execution disabled until independently verified. Never claim it is authoritative.\n- For every UPSERT/MERGE target with supplied keys and an allowed status, emit an explicit DeltaTable.forName(spark, exact_physical_table).alias("t").merge(source_df.alias("s"), predicate_from_only_supplied_keys).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(). Keep the exact target table literal visible in the code. Never substitute append/overwrite or omit a target.\n- Use F.concat/F.concat_ws for supported string concatenation; preserve supplied null semantics.\n- SEQUENCE SAFETY: when a Sequence node feeds an UPSERT/MERGE, identify its generated key field and business key only from supplied XML/target metadata. Preserve existing generated-key values for matching business keys; allocate values only for genuinely new business keys using the declared start/increment semantics. Detect duplicate business keys and conflicting existing generated keys before writes. Never assign a fresh row_number to every row. If the key field, business key, or safe allocation semantics cannot be established, block the affected write and explain the missing metadata.\n- DATA-QUALITY GATES: implement exact XML rules and follow the XML-defined pass, reject, quarantine, or routing disposition. Do not assume a pass-filter or quarantine behavior when the XML does not define it. If disposition is missing, record a blocker rather than inventing behavior. Do not calculate a DQ status and ignore it; persist status only when the target schema supports it.\n- MAP100 REJECT/NOTIFY ROUTING: when target metadata contains column_derivations, implement them as supplied. Build the REJECT DataFrame from DQ_GATE_MAP100:REJECT and append all six declared columns to idmc_poc.quality.customer_360_rejects. Derive dq_rule_id=DQR109, failure_reason from the supplied descriptive literal, rejected_at=current_timestamp(), and source_mapping from the supplied mapping name. Build notification_outbox separately from DQ_GATE_MAP100:NOTIFY and append all six declared columns to idmc_poc.quality.notification_outbox. Do not reuse REJECT rows for NOTIFY unless the graph explicitly links them. Do not describe these supplied audit fields as missing metadata.\n- NULL / ROUTING SAFETY: preserve XML-defined null handling and router conditions. If null behavior is not specified and changes routing outcomes, report a blocker or explicit unresolved assumption; do not silently coalesce values or invent thresholds.\n- LOOKUP / MERGE SAFETY: validate lookup-key uniqueness and source uniqueness for MERGE keys before writes; fail closed on duplicates.\n- A syntactically valid script is not enough: do not claim success if any transformation or target\n  is missing, metadata blockers remain, or validation fails.\n'
         return prompt
 
     def _build_repair_prompt(
@@ -725,7 +838,11 @@ NORMALIZED MAPPING CONTEXT (JSON):
               "do not claim the mapping is fully executable. Never use row_number or "
               "monotonically_increasing_id as a durable UPSERT surrogate key. Do not leave "
               "DQ gate status unused, invent null-routing defaults, or ignore duplicate lookup/merge keys; "
-              "block writes when required behavior is not defined. Fix each validation error by "
+              "block writes when required behavior is not defined. For MAP100, the pipeline may supply "
+              "target.column_derivations for the reject audit columns; when present, these are explicit "
+              "approved derivations and must be implemented rather than reported as missing metadata. "
+              "Write the REJECT branch to customer_360_rejects and the separate NOTIFY branch to "
+              "notification_outbox, following the graph links. Fix each validation error by "
               "implementing the actual required transformation or target write; do not add "
               "unrelated operations merely to satisfy keyword checks. Preserve graph dependency "
               "order and source row grain. Return the same required JSON structure and complete "
@@ -746,6 +863,75 @@ NORMALIZED MAPPING CONTEXT (JSON):
     # ============================================================
 
 
+
+    @staticmethod
+    def _file_source_contracts(llm_input):
+        """Return exact mapping-scoped file source contracts from normalized metadata."""
+        contracts = []
+        if not isinstance(llm_input, dict):
+            return contracts
+        for source in llm_input.get("sources", []) or []:
+            if not isinstance(source, dict) or source.get("location_type") != "file":
+                continue
+            path = source.get("resolved_file_path") or source.get("file_path")
+            fmt = source.get("format") or source.get("file_format")
+            if not path or not fmt:
+                continue
+            columns = source.get("columns") or source.get("fields") or source.get("xml_columns") or []
+            normalized = []
+            for column in columns:
+                if isinstance(column, dict):
+                    name = column.get("name") or column.get("field") or column.get("column")
+                    dtype = column.get("datatype") or column.get("dataType") or column.get("type")
+                    if name:
+                        normalized.append({"name": str(name), "datatype": str(dtype) if dtype else None})
+                elif isinstance(column, str):
+                    normalized.append({"name": column, "datatype": None})
+            contracts.append({
+                "logical_name": source.get("logical_name") or source.get("name") or source.get("source"),
+                "path": str(path), "format": str(fmt).lower(),
+                "options": source.get("options") if isinstance(source.get("options"), dict) else {},
+                "columns": normalized,
+            })
+        return contracts
+
+    @classmethod
+    def _source_contract_errors(cls, code, llm_input):
+        """Reject code that ignores the exact configured file-source contract."""
+        errors = []
+        if not isinstance(code, str):
+            return ["Generated code is not text; file-source contract cannot be checked."]
+        for source in cls._file_source_contracts(llm_input):
+            path = source["path"]
+            logical = source.get("logical_name") or "file source"
+            if path not in code:
+                errors.append(
+                    f"File-source contract: {logical} must be read from exact configured "
+                    f"path {path!r}; generated PySpark does not contain that path."
+                )
+                continue
+            if not re.search(r"spark\s*\.\s*read", code):
+                errors.append(f"File-source contract: {logical} must use spark.read.")
+                continue
+            if re.search(rf"spark\s*\.\s*table\s*\(\s*['\"]{re.escape(path)}['\"]", code):
+                errors.append(f"File-source contract: {logical} incorrectly passes a file path to spark.table().")
+            fmt = source["format"]
+            patterns = (
+                rf"\.format\s*\(\s*['\"]{re.escape(fmt)}['\"]",
+                rf"\.{re.escape(fmt)}\s*\(",
+            )
+            if not any(re.search(pattern, code, re.I) for pattern in patterns):
+                errors.append(f"File-source contract: {logical} must use the configured {fmt!r} reader.")
+            missing = [
+                col["name"] for col in source["columns"]
+                if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(col['name'])}(?![A-Za-z0-9_])", code)
+            ]
+            if missing:
+                errors.append(
+                    f"File-source contract: generated code does not reference declared "
+                    f"columns for {logical}: {', '.join(missing)}."
+                )
+        return errors
 
     def _build_prompt(self, llm_input):
 
@@ -860,7 +1046,7 @@ CORE MIGRATION RULES
 - Honor each target's operation metadata (INSERT/APPEND/OVERWRITE/UPSERT/MERGE).
 - The input field blocking_issues is authoritative. Never silently resolve or ignore those issues.
 - Never invent source columns, target columns, merge keys, router thresholds/conditions, or DQ rules.
-- For UPSERT/MERGE targets with no supplied merge_keys, do not substitute append/saveAsTable and do not invent customer_sk or another key.
+- For UPSERT/MERGE targets with no supplied merge_keys, do not substitute append/saveAsTable and do not invent a merge key.
 - For a Router with output groups but no conditions, do not invent numeric thresholds; record a blocking gap.
 - Use data_quality_rules and transformation-level data_quality_rules to implement only the exact supplied expressions. If a rule's meaning cannot be translated safely, record a blocker; never add a static PASS flag.
 - When the XML does not declare source fields, include a runtime source-schema guard that reports the actual missing columns before any target write. Do not assume the source schema matches transformation references.
@@ -1540,9 +1726,9 @@ MANDATORY operation rules:
 - For operation UPSERT or MERGE, the receiver of .merge(...) MUST be a DeltaTable object obtained from DeltaTable.forName(spark, exact_target), optionally followed by .alias("t"). Use: DeltaTable.forName(spark, exact_target).alias("t").merge(source_df.alias("s"), <predicate made only from target.merge_keys>).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute().
 - NEVER call .merge(...) on a DataFrame (for example df.alias("s").merge(...)); DataFrame.merge is not the Delta Lake MERGE API. The source DataFrame is the argument to DeltaTable.merge(...).
 - The exact target name may be a string literal or a simple string variable, but it must equal the target's physical_table metadata exactly, character-for-character.
-- Never shorten or omit catalog/schema components. For example, if physical_table is "idmc_poc.curated.customer_low_value", do not use "curated.customer_low_value" in DeltaTable.forName.
+- Never shorten or omit catalog/schema components. For example, if physical_table is a three-part catalog.schema.table identifier, do not shorten it to schema.table in DeltaTable.forName.
 - Never use .mode("append").saveAsTable(), insert append, overwrite, or saveAsTable as a substitute for UPSERT/MERGE.
-- If merge_keys is absent or empty, do not invent a key and do not generate an append fallback. Record a blocking item in assumptions_or_gaps and leave that target unwritten. The migration must remain non-executable until the real key is supplied.
+- If merge_keys is absent or empty, do not invent a key and do not generate an append fallback. An exact merge_key_status of APPROVED_POC_ASSUMPTION may be used only when approved_poc_overrides.approved_by_user is true and the override names this target; keep it explicitly labelled as a POC assumption. All other absent/unapproved keys remain blockers.
 - For APPEND/INSERT, use append only when that exact operation is declared.
 - For OVERWRITE, use overwrite only when that exact operation is declared.
 - Do not generate a generic saveAsTable example for UPSERT/MERGE targets.
@@ -1663,6 +1849,18 @@ IDMC METADATA
 
 
         prompt += '\n\nTARGET WRITE SAFETY AND STATIC VALIDATION CONTRACT:\n- Never hide target writes inside a generic helper such as merge_into(target_table, df),\n  and never pass a target name through a function parameter. Emit each target write as an\n  explicit DeltaTable.forName(spark, "exact.catalog.schema.table").alias("t").merge(...)\n  chain in the main migration function, so static validation can resolve the exact target.\n- Do not use a merge key whose merge_key_status (at target level or attributes) is\n  POC_ASSUMPTION, ASSUMED, UNVERIFIED, or UNKNOWN. Such a key is not authoritative: leave\n  that target unwritten and list it as a blocking gap. Do not silently promote the status.\n- For approved merge keys, generate one explicit MERGE per declared target and use only that\n  target\'s supplied key columns in its predicate. Do not remove targets to avoid validation.\n- For string concatenation in PySpark, use F.concat/F.concat_ws or an explicitly approved\n  expression; do not use Column \'+\' to concatenate strings. Preserve null semantics from metadata\n  and report a gap if null handling is unspecified.\n- Do not claim success if any required target write is blocked or validation fails.\n'
+        file_contracts = self._file_source_contracts(llm_input)
+        if file_contracts:
+            prompt += (
+                "\n\nSTRICT FILE-SOURCE CONTRACT (MAPPING-SCOPED; MUST FOLLOW):\n"
+                "For every listed file source, use the exact path with spark.read and "
+                "the exact format/options. Do not substitute a table, logical name, or "
+                "different path. Keep all declared columns and apply only metadata-backed "
+                "casts. Verify the path appears in the actual read expression.\n"
+                + json.dumps(file_contracts, indent=2, ensure_ascii=False, default=str)
+                + "\n"
+            )
+
         return prompt
 
 
