@@ -138,6 +138,7 @@ class MigrationPipeline:
         verbose=False,
         human_review_dir=None,
         approved_review_id=None,
+        approved_review_ids=None,
     ):
 
         self.xml_path = xml_path
@@ -160,6 +161,16 @@ class MigrationPipeline:
             self.output_dir, "human_reviews"
         )
         self.human_gateway = HumanGateway(review_dir=self.human_review_dir)
+        # Explicit mapping_name -> persisted Human Gateway review_id mapping.
+        # This is intentionally supplied by the caller; the pipeline never
+        # auto-approves or guesses which review belongs to a mapping.
+        self.approved_review_ids = {
+            str(mapping).strip(): str(review_id).strip()
+            for mapping, review_id in dict(approved_review_ids or {}).items()
+            if mapping is not None and review_id is not None
+            and str(mapping).strip() and str(review_id).strip()
+        }
+        # Backward compatibility for callers using the older single-review API.
         self.approved_review_id = approved_review_id
 
         if not self.dry_run and not self.execution_approved:
@@ -248,24 +259,111 @@ class MigrationPipeline:
             review_id=review_id, decision=decision, reviewer=reviewer, comment=comment
         )
 
-    def _approved_review_matches(self, mapping_name, category):
-        """Check an explicitly supplied approved review; never infer approval."""
-        if not self.approved_review_id:
-            return False
-        review = self.human_gateway.get_review(self.approved_review_id)
+    def _approved_review_for_mapping(self, mapping_name, category):
+        """Return a verified, explicitly supplied approval for this mapping.
+
+        A review is accepted only when its ID was supplied for this exact mapping,
+        the persisted record matches the mapping/category, the reviewer decision is
+        APPROVE, the review is PASS, all technical validations passed, can_execute
+        is true, and HumanGateway.can_proceed independently confirms the decision.
+        """
+        review_id = self.approved_review_ids.get(mapping_name)
+
+        # Preserve the legacy single-ID option, but only if its persisted mapping
+        # matches the mapping currently being processed.
+        if not review_id and self.approved_review_id:
+            review_id = self.approved_review_id
+
+        if not review_id:
+            return None
+
+        try:
+            review = self.human_gateway.get_review(review_id)
+        except Exception as exc:
+            if self.verbose:
+                print(
+                    f"[HUMAN GATEWAY] Could not load supplied review "
+                    f"{review_id!r} for {mapping_name}: {exc}"
+                )
+            return None
+
+        if not isinstance(review, dict):
+            return None
+
         if review.get("mapping_name") != mapping_name:
-            return False
+            if self.verbose:
+                print(
+                    f"[HUMAN GATEWAY] Review {review_id} belongs to "
+                    f"{review.get('mapping_name')!r}, not {mapping_name!r}."
+                )
+            return None
+
+        decision_info = review.get("decision") or {}
+        decision = (
+            decision_info.get("decision")
+            if isinstance(decision_info, dict)
+            else decision_info
+        )
+        reviewer = (
+            decision_info.get("reviewer")
+            if isinstance(decision_info, dict)
+            else None
+        )
+
         reviewed_categories = {
-            str(i.get("category", "")).upper() for i in review.get("issues", [])
+            str(item.get("category", "")).strip().upper()
+            for item in (review.get("issues") or [])
+            if isinstance(item, dict) and item.get("category")
         }
         reviewed_categories.update(
-            str(x).upper() for x in review.get("resolved_categories", [])
+            str(value).strip().upper()
+            for value in (review.get("resolved_categories") or [])
+            if value is not None
         )
-        if category.upper() not in reviewed_categories:
-            return False
-        return self.human_gateway.can_proceed(
-            review, execution_approved=self.execution_approved
-        )
+
+        if category.strip().upper() not in reviewed_categories:
+            if self.verbose:
+                print(
+                    f"[HUMAN GATEWAY] Review {review_id} does not cover "
+                    f"category {category!r}."
+                )
+            return None
+
+        # Fail closed: do not rely only on the decision string.
+        if decision != "APPROVE":
+            return None
+        if review.get("status") != PASS:
+            return None
+        if review.get("validations_passed") is not True:
+            return None
+        if review.get("can_execute") is not True:
+            return None
+
+        try:
+            can_proceed = self.human_gateway.can_proceed(
+                review, execution_approved=self.execution_approved
+            )
+        except Exception as exc:
+            if self.verbose:
+                print(f"[HUMAN GATEWAY] can_proceed check failed: {exc}")
+            return None
+
+        if can_proceed is not True:
+            return None
+
+        return {
+            "review_id": review_id,
+            "mapping_name": mapping_name,
+            "status": review.get("status"),
+            "decision": decision,
+            "reviewer": reviewer,
+            "validations_passed": review.get("validations_passed"),
+            "can_execute": review.get("can_execute"),
+        }
+
+    def _approved_review_matches(self, mapping_name, category):
+        """Boolean compatibility wrapper for the mapping-specific approval check."""
+        return self._approved_review_for_mapping(mapping_name, category) is not None
 
     def parse_specialized_metadata(self, root, repository):
         """Parse additional IDMC assets and validate cross-references."""
@@ -1068,6 +1166,8 @@ class MigrationPipeline:
                     or "unknown target"
                 )
 
+        approval_details = None
+
         if synthetic_targets:
             message = (
                 "Target merge keys are marked SYNTHETIC_POC: "
@@ -1075,9 +1175,22 @@ class MigrationPipeline:
                 + ". A reviewer must confirm their use for this POC."
             )
 
-            approved = self._approved_review_matches(
+            approval_details = self._approved_review_for_mapping(
                 mapping_name, "UNVERIFIED_MERGE_KEY"
             )
+            approved = approval_details is not None
+
+            if approved:
+                print(
+                    "Human Gateway approval verified: "
+                    f"{approval_details['review_id']} "
+                    f"(reviewer={approval_details.get('reviewer')})"
+                )
+            else:
+                print(
+                    f"Human Gateway approval NOT verified for {mapping_name}; "
+                    "mapping remains blocked."
+                )
 
             if not approved:
                 review_result = self._human_review_result(
@@ -1114,7 +1227,13 @@ class MigrationPipeline:
                         "Set allow_synthetic_merge_keys=True only for an "
                         "explicitly approved POC run."
                     ),
-                    "review_id": self.approved_review_id,
+                    "review_id": approval_details.get("review_id"),
+                    "approval_required": True,
+                    "approval_verified": True,
+                    "approval_review_id": approval_details.get("review_id"),
+                    "approval_status": approval_details.get("status"),
+                    "approval_decision": approval_details.get("decision"),
+                    "approval_reviewer": approval_details.get("reviewer"),
                     "validation": validation_result,
                 }
 
@@ -1138,6 +1257,22 @@ class MigrationPipeline:
                 "llm_result_path": llm_result_path,
                 "generated_pyspark": pyspark_path,
                 "blocking_issues": llm_input.get("blocking_issues", []),
+                "approval_required": bool(synthetic_targets),
+                "approval_verified": (
+                    approval_details is not None if synthetic_targets else None
+                ),
+                "approval_review_id": (
+                    approval_details.get("review_id") if approval_details else None
+                ),
+                "approval_status": (
+                    approval_details.get("status") if approval_details else None
+                ),
+                "approval_decision": (
+                    approval_details.get("decision") if approval_details else None
+                ),
+                "approval_reviewer": (
+                    approval_details.get("reviewer") if approval_details else None
+                ),
             }
 
         # 8. EXECUTE GENERATED PYSPARK
@@ -2325,11 +2460,26 @@ class MigrationPipeline:
             ),
             "error_count": len(validation.get("errors", []) or []),
             "warning_count": len(validation.get("warnings", []) or []),
-            "review_id": result.get("review_id") or human_review.get("review_id"),
-            "review_status": human_review.get("status"),
+            "review_id": (
+                result.get("review_id")
+                or human_review.get("review_id")
+                or result.get("approval_review_id")
+            ),
+            "review_status": (
+                human_review.get("status") or result.get("approval_status")
+            ),
             "review_scope": human_review.get("scope"),
             "review_issues": human_review.get("issues", []),
-            "review_decision": human_review.get("decision"),
+            "review_decision": (
+                human_review.get("decision") or result.get("approval_decision")
+            ),
+            "approval_required": result.get("approval_required"),
+            "approval_verified": result.get("approval_verified"),
+            "human_approval_verified": result.get("approval_verified"),
+            "approval_review_id": result.get("approval_review_id"),
+            "approval_status": result.get("approval_status"),
+            "approval_decision": result.get("approval_decision"),
+            "approval_reviewer": result.get("approval_reviewer"),
             "generated_pyspark": result.get("generated_pyspark"),
             "llm_result_path": result.get("llm_result_path"),
             "error": result.get("error"),
