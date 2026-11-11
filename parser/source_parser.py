@@ -1,126 +1,93 @@
+"""Parse source definitions from legacy/IDMC and PowerCenter repository XML.
+
+PowerCenter SESSION/SESSIONEXTENSION reader entries are runtime/session
+references, not SOURCE definitions. They are intentionally not promoted to
+source definitions by this parser.
+"""
+
+
 class SourceParser:
+    SOURCE_TAGS = {"source", "sourceinstance"}
+    COLUMN_TAGS = {"column", "field", "sourcefield"}
+    CONTAINER_TAGS = {"sources", "sourceinstances"}
 
     def parse(self, folder):
-
-        sources_element = folder.find("Sources")
-
-        if sources_element is None:
+        if folder is None:
             return []
 
         sources = []
+        # Legacy/IDMC containers, plus direct definitions where present.
+        containers = [e for e in list(folder) if self._tag(e) in self.CONTAINER_TAGS]
+        candidates = []
+        for container in containers:
+            candidates.extend(e for e in list(container) if self._tag(e) in self.SOURCE_TAGS)
+        candidates.extend(e for e in list(folder) if self._tag(e) in self.SOURCE_TAGS)
 
-        for source in sources_element.findall("Source"):
-
-            source_data = {
-                "name": source.get("name"),
-                "type": source.get("type"),
-                "connection": source.get("connection"),
-
-                # Preserve ALL Source attributes
-                "attributes": dict(source.attrib),
-
-                "columns": [],
-
-                # Preserve unknown Source elements
-                "extensions": []
-            }
-
-            # -------------------------------------------------
-            # COLUMNS
-            # -------------------------------------------------
-
-            # Your XML uses direct <Column> elements:
-            #
-            # <Source>
-            #     <Column .../>
-            #     <Column .../>
-            # </Source>
-            #
-            # Keep support for <Columns><Column/></Columns>
-            # as well.
-
-            columns_element = source.find("Columns")
-
-            if columns_element is not None:
-
-                column_elements = columns_element.findall("Column")
-
-            else:
-
-                column_elements = source.findall("Column")
-
-            for column in column_elements:
-
-                column_data = {
-                    "name": column.get("name"),
-                    "datatype": column.get("datatype"),
-                    "nullable": column.get("nullable"),
-                    "length": column.get("length"),
-                    "precision": column.get("precision"),
-                    "scale": column.get("scale"),
-
-                    # Preserve ALL column attributes
-                    "attributes": dict(column.attrib),
-
-                    # Preserve unknown column children
-                    "extensions": []
-                }
-
-                # -------------------------------------------------
-                # PRESERVE UNKNOWN COLUMN CHILDREN
-                # -------------------------------------------------
-
-                for child in column:
-
-                    column_data["extensions"].append(
-                        self._element_to_dict(child)
-                    )
-
-                source_data["columns"].append(
-                    column_data
-                )
-
-            # -------------------------------------------------
-            # PRESERVE UNKNOWN SOURCE ELEMENTS
-            # -------------------------------------------------
-
-            known_elements = {
-                "Columns",
-                "Column"
-            }
-
-            for child in source:
-
-                if child.tag not in known_elements:
-
-                    source_data["extensions"].append(
-                        self._element_to_dict(child)
-                    )
-
-            sources.append(source_data)
-
+        seen = set()
+        for source in candidates:
+            identity = (id(source), source.get("NAME") or source.get("name"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            sources.append(self._parse_source(source))
         return sources
 
-    # =========================================================
-    # GENERIC XML ELEMENT CONVERTER
-    # =========================================================
+    def _parse_source(self, source):
+        columns = []
+        column_tags = self.COLUMN_TAGS
+        for child in list(source):
+            if self._tag(child) in {"columns", "fields", "sourcefields"}:
+                columns.extend(self._parse_columns(child, column_tags))
+            elif self._tag(child) in column_tags:
+                columns.append(self._parse_column(child))
 
-    def _element_to_dict(self, element):
-
-        data = {
-            "tag": element.tag,
-            "attributes": dict(element.attrib),
-            "children": []
+        name = self._attr(source, "name")
+        return {
+            "id": self._attr(source, "id"),
+            "name": name,
+            "type": self._attr(source, "type", "objecttype"),
+            "connection": self._attr(source, "connection", "connectionname"),
+            "source": self._attr(source, "source", "object", "name"),
+            "attributes": dict(source.attrib),
+            "columns": columns,
+            "extensions": [self._element_to_dict(c) for c in source
+                            if self._tag(c) not in column_tags | {"columns", "fields", "sourcefields"}],
         }
 
+    def _parse_columns(self, container, allowed_tags):
+        result = []
+        for element in container.iter():
+            if element is not container and self._tag(element) in allowed_tags:
+                result.append(self._parse_column(element))
+        return result
+
+    def _parse_column(self, column):
+        return {
+            "name": self._attr(column, "name"),
+            "datatype": self._attr(column, "datatype", "datatype", "data_type"),
+            "nullable": self._attr(column, "nullable", "nullability"),
+            "length": self._attr(column, "length", "precision"),
+            "precision": self._attr(column, "precision"),
+            "scale": self._attr(column, "scale"),
+            "attributes": dict(column.attrib),
+            "extensions": [self._element_to_dict(c) for c in column],
+        }
+
+    @staticmethod
+    def _tag(element):
+        return str(element.tag).split("}")[-1].lower()
+
+    @staticmethod
+    def _attr(element, *names):
+        lookup = {str(k).lower(): v for k, v in element.attrib.items()}
+        for name in names:
+            if name.lower() in lookup:
+                return lookup[name.lower()]
+        return None
+
+    def _element_to_dict(self, element):
+        data = {"tag": element.tag, "attributes": dict(element.attrib), "children": []}
         if element.text and element.text.strip():
-
             data["text"] = element.text.strip()
-
-        for child in element:
-
-            data["children"].append(
-                self._element_to_dict(child)
-            )
-
+        data["children"] = [self._element_to_dict(c) for c in element]
         return data

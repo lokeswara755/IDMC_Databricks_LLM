@@ -1,158 +1,65 @@
+"""Parse IDMC ports and PowerCenter transformation field/port metadata.
+
+Supports Ports/Port, direct Port children, and PowerCenter TRANSFORMFIELD
+(or SOURCEFIELD/TARGETFIELD) elements when a mapping definition is available.
+"""
+
+
 class PortParser:
-    """
-    Generic IDMC port parser.
-
-    Supports:
-        <Ports>
-            <Port .../>
-        </Ports>
-
-    and also:
-
-        <Transformation>
-            <Port .../>
-            <Port .../>
-        </Transformation>
-
-    All port attributes and unknown child elements are preserved.
-    """
+    PORT_TAGS = {"port", "transformfield", "sourcefield", "targetfield", "field"}
+    CONTAINER_TAGS = {"ports", "transformfields", "sourcefields", "targetfields", "fields"}
 
     def parse(self, parent_element):
-
         if parent_element is None:
             return []
-
-        ports = []
-
-        # =====================================================
-        # FIND PORT ELEMENTS
-        # =====================================================
-
-        # Case 1:
-        # <Ports>
-        #     <Port />
-        # </Ports>
-
-        ports_element = parent_element.find("Ports")
-
-        if ports_element is not None:
-
-            for element in ports_element.iter("Port"):
-
-                port_data = self._parse_port(element)
-
-                if port_data:
-                    ports.append(port_data)
-
-            return ports
-
-        # =====================================================
-        # CASE 2:
-        # DIRECT PORT CHILDREN
-        #
-        # <Transformation>
-        #     <Port />
-        #     <Port />
-        # </Transformation>
-        # =====================================================
-
-        for child in parent_element:
-
-            if child.tag == "Port":
-
-                port_data = self._parse_port(child)
-
-                if port_data:
-                    ports.append(port_data)
-
-        return ports
-
-    # =========================================================
-    # PARSE SINGLE PORT
-    # =========================================================
+        results = []
+        # Collect only the relevant port-like elements. Avoid parsing nested
+        # child metadata twice by selecting direct children or one known container.
+        containers = [c for c in list(parent_element) if self._tag(c) in self.CONTAINER_TAGS]
+        if containers:
+            for container in containers:
+                for element in container.iter():
+                    if element is not container and self._tag(element) in self.PORT_TAGS:
+                        results.append(self._parse_port(element))
+        else:
+            for child in list(parent_element):
+                if self._tag(child) in self.PORT_TAGS:
+                    results.append(self._parse_port(child))
+        return results
 
     def _parse_port(self, port):
-
-        if port is None:
-            return None
-
-        port_data = {
-            "name": port.get("name"),
-            "datatype": port.get("datatype"),
-            "direction": port.get("direction"),
-            "expression": None,
-            "attributes": dict(port.attrib),
-            "extensions": []
+        attrs = dict(port.attrib)
+        expression = self._attr(port, "expression", "defaultvalue")
+        expression_element = next((c for c in list(port) if self._tag(c) in {"expression", "expressiontext"}), None)
+        if expression_element is not None:
+            text = "".join(expression_element.itertext()).strip()
+            if text:
+                expression = text
+        return {
+            "name": self._attr(port, "name"),
+            "datatype": self._attr(port, "datatype", "datatype", "data_type"),
+            "direction": self._attr(port, "direction", "porttype", "porttype"),
+            "expression": expression.strip() if isinstance(expression, str) else expression,
+            "attributes": attrs,
+            "extensions": [self._element_to_dict(c) for c in port
+                           if self._tag(c) not in {"expression", "expressiontext"}],
         }
 
-        # =====================================================
-        # EXPRESSION
-        #
-        # Supports:
-        #
-        # <Port expression="..."/>
-        #
-        # and:
-        #
-        # <Port>
-        #     <Expression>...</Expression>
-        # </Port>
-        # =====================================================
+    @staticmethod
+    def _tag(element):
+        return str(element.tag).split("}")[-1].lower()
 
-        attribute_expression = port.get("expression")
-
-        if attribute_expression:
-            port_data["expression"] = attribute_expression.strip()
-
-        expression = port.find("Expression")
-
-        if expression is not None:
-
-            expression_text = "".join(
-                expression.itertext()
-            ).strip()
-
-            if expression_text:
-                port_data["expression"] = expression_text
-
-        # =====================================================
-        # PRESERVE UNKNOWN PORT CHILD ELEMENTS
-        # =====================================================
-
-        known_elements = {
-            "Expression"
-        }
-
-        for child in port:
-
-            if child.tag not in known_elements:
-
-                port_data["extensions"].append(
-                    self._element_to_dict(child)
-                )
-
-        return port_data
-
-    # =========================================================
-    # GENERIC XML ELEMENT CONVERTER
-    # =========================================================
+    @staticmethod
+    def _attr(element, *names):
+        lookup = {str(k).lower(): v for k, v in element.attrib.items()}
+        for name in names:
+            if name.lower() in lookup:
+                return lookup[name.lower()]
+        return None
 
     def _element_to_dict(self, element):
-
-        data = {
-            "tag": element.tag,
-            "attributes": dict(element.attrib),
-            "children": []
-        }
-
+        data = {"tag": element.tag, "attributes": dict(element.attrib), "children": []}
         if element.text and element.text.strip():
-
             data["text"] = element.text.strip()
-
-        for child in element:
-
-            data["children"].append(
-                self._element_to_dict(child)
-            )
-
+        data["children"] = [self._element_to_dict(c) for c in element]
         return data

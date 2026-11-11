@@ -67,48 +67,6 @@ def make_json_serializable(obj):
     return str(obj)
 
 
-
-from datetime import date, datetime
-from decimal import Decimal
-from dataclasses import asdict, is_dataclass
-
-
-def make_json_serializable(obj):
-    """Convert parsed IDMC metadata into values supported by json.dump."""
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-
-    if isinstance(obj, Decimal):
-        return str(obj)
-
-    if is_dataclass(obj):
-        return make_json_serializable(asdict(obj))
-
-    if isinstance(obj, dict):
-        return {
-            str(key): make_json_serializable(value)
-            for key, value in obj.items()
-        }
-
-    if isinstance(obj, (list, tuple, set)):
-        values = list(obj)
-        if isinstance(obj, set):
-            values = sorted(values, key=repr)
-        return [make_json_serializable(value) for value in values]
-
-    if hasattr(obj, "to_dict") and callable(obj.to_dict):
-        return make_json_serializable(obj.to_dict())
-
-    if hasattr(obj, "__dict__"):
-        return make_json_serializable(vars(obj))
-
-    # Keep the save operation from failing on unexpected parser-specific types.
-    return str(obj)
-
-
 class MigrationPipeline:
 
     def __init__(
@@ -421,7 +379,7 @@ class MigrationPipeline:
 
         print("\n" + "=" * 60)
 
-        print("IDMC TO DATABRICKS - LLM MIGRATION")
+        print("INFORMATICA TO DATABRICKS - LLM MIGRATION")
 
         print("=" * 60)
         print(f"Execution mode: {'DRY RUN (no generated PySpark execution)' if self.dry_run else 'LIVE EXECUTION (generated PySpark may write to targets)'}")
@@ -434,7 +392,7 @@ class MigrationPipeline:
 
             # ----------------------------------------------------
 
-            print("\n[1/5] Reading IDMC XML...")
+            print("\n[1/5] Reading Informatica XML...")
 
             try:
                 root = self.xml_reader.read()
@@ -467,7 +425,7 @@ class MigrationPipeline:
 
             # ----------------------------------------------------
 
-            print("\n[2/5] Parsing IDMC repository...")
+            print("\n[2/5] Parsing Informatica repository...")
 
             repository = self.repository_parser.parse(
 
@@ -500,29 +458,52 @@ class MigrationPipeline:
             )
 
             # ----------------------------------------------------
-            # 2.1 PARSE SPECIALIZED METADATA
+            # 2.1 FORMAT-AWARE METADATA PARSING
             # ----------------------------------------------------
-
-            print("\n[2.1/5] Parsing specialized metadata...")
-            metadata_bundle = self.parse_specialized_metadata(
-                root=root,
-                repository=repository
+            repository_format = str(
+                repository.get("format") or "IDMC"
+            ).strip().upper()
+            is_powercenter = (
+                repository_format == "POWERCENTER"
+                or str(root.tag).split("}")[-1].strip().lower() == "powermart"
             )
-            print("Specialized metadata parsing completed.")
+
+            if is_powercenter:
+                # PowerCenter exports can contain session/workflow metadata and
+                # mapping references without containing the actual mapping
+                # definitions (SOURCE/TARGET/TRANSFORMATION/CONNECTOR lineage).
+                # Do not run IDMC-only asset parsers or treat session references
+                # as executable mapping definitions.
+                print("\n[2.1/5] PowerCenter XML detected.")
+                print("Skipping IDMC-only specialized metadata parsers.")
+                metadata_bundle = {
+                    "format": "POWERCENTER",
+                    "repository": repository,
+                    "migration_status": "INVENTORY_ONLY",
+                }
+                self.metadata_bundle = metadata_bundle
+            else:
+                print("\n[2.1/5] Parsing specialized IDMC metadata...")
+                metadata_bundle = self.parse_specialized_metadata(
+                    root=root,
+                    repository=repository
+                )
+                print("Specialized IDMC metadata parsing completed.")
 
             # ----------------------------------------------------
-            # 2.2 SAVE AND PRINT PARSED IDMC METADATA (BEFORE LLM)
+            # 2.2 SAVE PARSED REPOSITORY METADATA
             # ----------------------------------------------------
-            print("\n[2.2/5] Saving parsed IDMC metadata...")
-
+            print("\n[2.2/5] Saving parsed repository metadata...")
             parsed_objects = make_json_serializable(metadata_bundle)
             parsed_dir = "/Volumes/idmc_poc/bronze/idmc_files/parsed_metadata"
             os.makedirs(parsed_dir, exist_ok=True)
 
-            parsed_path = os.path.join(
-                parsed_dir,
-                "idmc_parsed_objects.json"
+            parsed_filename = (
+                "powercenter_parsed_objects.json"
+                if is_powercenter
+                else "idmc_parsed_objects.json"
             )
+            parsed_path = os.path.join(parsed_dir, parsed_filename)
 
             with open(parsed_path, "w", encoding="utf-8") as parsed_file:
                 json.dump(
@@ -540,11 +521,41 @@ class MigrationPipeline:
                 else:
                     print(f"  {object_name}: {type(object_value).__name__}")
 
-            print("\nParsed metadata preview (first 12,000 characters):")
-            print(
-                json.dumps(parsed_objects, indent=2, ensure_ascii=False)[:12000]
-            )
+            # PowerCenter session mapping references are inventory records, not
+            # mapping definitions. Stop safely when the export has no definitions.
+            mapping_definitions = [
+                mapping
+                for folder in folders
+                for mapping in (folder.get("mappings") or [])
+            ]
+            mapping_references = repository.get("mapping_references") or []
 
+            if is_powercenter and not mapping_definitions:
+                print("\n[3/5] Mapping migration skipped.")
+                print("Status: NO_MAPPING_DEFINITIONS")
+                print(f"Mapping references found: {len(mapping_references)}")
+                print("No GraphBuilder or LLM calls will be made for mapping references.")
+                print("The PowerCenter repository/session inventory was parsed and saved.")
+
+                inventory_result = {
+                    "success": True,
+                    "stage": "NO_MAPPING_DEFINITIONS",
+                    "migration_status": "NOT_STARTED",
+                    "format": "POWERCENTER",
+                    "mapping_definition_count": 0,
+                    "mapping_reference_count": len(mapping_references),
+                    "mapping_references": mapping_references,
+                    "parsed_metadata_path": parsed_path,
+                    "dry_run": self.dry_run,
+                    "executed": False,
+                    "message": (
+                        "PowerCenter metadata inventory completed. The XML contains "
+                        "session-to-mapping references but no mapping definitions; "
+                        "LLM migration was correctly skipped."
+                    ),
+                }
+                print("\n[5/5] PowerCenter inventory completed; no migration was attempted.")
+                return [inventory_result]
 
             # ----------------------------------------------------
 
