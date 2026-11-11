@@ -1,0 +1,27 @@
+{
+  "status": "PARTIAL",
+  "valid": true,
+  "checks": {
+    "python_syntax": "PASS",
+    "service_handler_coverage": "PASS",
+    "metadata_integrity": "PASS",
+    "unsafe_execution": "PASS",
+    "mapping_semantics": "NOT_VALIDATED",
+    "task_execution": "NOT_RUN",
+    "data_validation": "NOT_RUN"
+  },
+  "errors": [],
+  "warnings": [
+    "69 unresolved links remain; automatic orchestration is blocked.",
+    "Mapping definitions are absent; data transformation semantics cannot be validated."
+  ],
+  "service_count": 15,
+  "covered_handler_count": 15,
+  "handler_coverage_percentage": 100.0,
+  "missing_handlers": [],
+  "unsafe_calls": [],
+  "data_task_count": 5,
+  "command_task_count": 10,
+  "execution_performed": false,
+  "data_validation_performed": false
+}

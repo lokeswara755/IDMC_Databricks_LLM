@@ -405,6 +405,120 @@ class MigrationPipeline:
         self.metadata_bundle = metadata_bundle
         return metadata_bundle
 
+    def _run_taskflow_inventory(self, repository):
+        """Persist parsed IDMC Taskflow metadata and return honest inventory status.
+
+        This export can describe taskflow orchestration, task references,
+        parameters, conditions, operations and command invocations. It does not
+        embed the referenced Mapping definitions, so mapping-level PySpark is
+        deliberately not generated from this file.
+        """
+        print("\n[IDMC TASKFLOW] Taskflow parsing and inventory mode")
+        parsed_objects = make_json_serializable({
+            "repository": repository,
+            "analysis_mode": "TASKFLOW_ORCHESTRATION_INVENTORY",
+            "mapping_definition_included": False,
+            "mapping_pyspark_generated": False,
+            "execution_performed": False,
+        })
+        parsed_dir = "/Volumes/idmc_poc/bronze/idmc_files/parsed_metadata"
+        os.makedirs(parsed_dir, exist_ok=True)
+        parsed_path = os.path.join(parsed_dir, "idmc_taskflow_parsed_objects.json")
+        with open(parsed_path, "w", encoding="utf-8") as parsed_file:
+            json.dump(parsed_objects, parsed_file, indent=2, ensure_ascii=False)
+
+        summary = repository.get("summary", {})
+        print("Taskflow:", summary.get("asset_name"))
+        print("Input parameters:", summary.get("parameter_count", 0))
+        print("Temporary fields:", summary.get("temp_field_count", 0))
+        print("Services:", summary.get("service_count", 0))
+        print("  Data task invocations:", summary.get("data_task_count", 0))
+        print("  Command task invocations:", summary.get("command_task_count", 0))
+        print("Control-flow nodes:", summary.get("control_flow_node_count", 0))
+        print("Links:", summary.get("link_count", 0))
+        print("Operations:", summary.get("operation_count", 0))
+        print("Mapping definitions included:", summary.get("mapping_definition_included"))
+        print("Saved parsed metadata:", parsed_path)
+        print("No mapping LLM generation or Spark target execution was attempted.")
+
+        self.metadata_bundle = parsed_objects
+        return [{
+            "success": None,
+            "mapping_name": summary.get("asset_name") or "IDMC_TASKFLOW",
+            "stage": "INVENTORIED_ONLY",
+            "status": "TASKFLOW_PARSED_MAPPING_DEFINITIONS_NOT_INCLUDED",
+            "error": (
+                "Taskflow orchestration was parsed. Referenced Mapping Task assets are not "
+                "embedded in this XML, so exact mapping transformations and mapping-level "
+                "PySpark cannot be generated from this file alone."
+            ),
+            "dry_run": True,
+            "executed": False,
+            "parsed_metadata_path": parsed_path,
+            "summary": summary,
+        }]
+
+    def _run_powercenter_inventory(self, repository):
+        """Save a read-only PowerCenter inventory and return report rows.
+
+        This is deliberately not a mapping migration run: the supplied XML
+        contains session references and workflow metadata, but no MAPPING
+        definitions. No LLM calls, source preflight, graph generation, or
+        target writes are performed in this branch.
+        """
+        print("\n[POWERCENTER] Read-only repository inventory mode")
+        parsed_objects = make_json_serializable({
+            "repository": repository,
+            "analysis_mode": "READ_ONLY_INVENTORY",
+            "mapping_lineage_generated": False,
+            "execution_performed": False,
+        })
+        parsed_dir = "/Volumes/idmc_poc/bronze/idmc_files/parsed_metadata"
+        os.makedirs(parsed_dir, exist_ok=True)
+        parsed_path = os.path.join(parsed_dir, "powercenter_parsed_objects.json")
+        with open(parsed_path, "w", encoding="utf-8") as parsed_file:
+            json.dump(parsed_objects, parsed_file, indent=2, ensure_ascii=False)
+
+        summary = repository.get("summary", {})
+        print("Repository:", repository.get("name"))
+        print("Folders:", summary.get("folder_count", 0))
+        print("Folder-direct sessions:", summary.get("session_count", 0))
+        print("Workflows:", summary.get("workflow_count", 0))
+        print("Mapping references:", summary.get("mapping_reference_count", 0))
+        print("Mapping definitions in export:", summary.get("mapping_definition_count", 0))
+        print("Saved parsed metadata:", parsed_path)
+
+        rows = []
+        for ref in repository.get("mapping_references", []):
+            rows.append({
+                "success": None,
+                "mapping_name": ref.get("mapping_name"),
+                "session_name": ref.get("session_name"),
+                "scope": ref.get("scope"),
+                "stage": "INVENTORIED_ONLY",
+                "status": "MAPPING_DEFINITION_NOT_INCLUDED",
+                "error": "Mapping reference found in session metadata; mapping definition and dataflow links are not present in this XML export.",
+                "dry_run": True,
+                "executed": False,
+                "parsed_metadata_path": parsed_path,
+            })
+        if not rows:
+            rows.append({
+                "success": None,
+                "mapping_name": "REPOSITORY_INVENTORY",
+                "stage": "INVENTORIED_ONLY",
+                "status": "NO_MAPPING_REFERENCES_FOUND",
+                "error": "No session mapping references were found in this export.",
+                "dry_run": True,
+                "executed": False,
+                "parsed_metadata_path": parsed_path,
+            })
+
+        self.metadata_bundle = parsed_objects
+        print("\nNo LLM generation or Spark target execution was attempted.")
+        print("PowerCenter inventory completed.")
+        return rows
+
     # ============================================================
 
     # MAIN PIPELINE
@@ -498,6 +612,19 @@ class MigrationPipeline:
                 f"{len(folders)}"
 
             )
+
+            # PowerCenter exports are session/workflow-oriented. They do not
+            # necessarily contain MAPPING definitions. Inventory them in a
+            # dedicated read-only branch; never send session instances to the
+            # mapping graph builder or LLM generator.
+            if repository.get("format") == "POWERCENTER":
+                return self._run_powercenter_inventory(repository)
+
+            # IDMC Taskflow exports describe orchestration, not mapping dataflow
+            # definitions. Parse and inventory their real structure without
+            # sending them through mapping GraphBuilder / LLM PySpark generation.
+            if repository.get("format") == "IDMC_TASKFLOW":
+                return self._run_taskflow_inventory(repository)
 
             # ----------------------------------------------------
             # 2.1 PARSE SPECIALIZED METADATA

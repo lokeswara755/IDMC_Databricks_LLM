@@ -1,0 +1,323 @@
+{
+  "taskflow_name": "wf_s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+  "generated_file": "/Workspace/Users/lokeswaraseetaramasastry.k@tcs.com/IDMC_Databricks_LLM/output/taskflow_llm/generated_wf_s_m_tim_stg_unq_wrkstn_nomtch_sync.py",
+  "model": "databricks-gpt-oss-120b",
+  "generation_method": "SERVICE_SCOPED_LLM_CHUNKING",
+  "parsed_counts": {
+    "service_count": 15,
+    "data_task_count": 5,
+    "command_task_count": 10,
+    "operation_count": 276,
+    "control_flow_node_count": 77,
+    "graph_node_count": 223,
+    "parameter_count": 37,
+    "temp_field_count": 42,
+    "link_count": 99,
+    "containment_edge_count": 222,
+    "inferred_dependency_count": 30,
+    "condition_dependency_count": 8,
+    "unresolved_link_count": 69
+  },
+  "generation_metrics": {
+    "status": "PASS",
+    "valid": true,
+    "errors": [],
+    "warnings": [],
+    "checks": {
+      "python_syntax": "PASS",
+      "pyspark_import": "PASS",
+      "service_function_coverage": "PASS",
+      "dataframe_transformations": "PASS",
+      "unsafe_execution": "PASS",
+      "operation_traceability": "PASS",
+      "task_execution": "NOT_RUN",
+      "data_validation": "NOT_RUN"
+    },
+    "service_count": 15,
+    "generated_service_functions": 15,
+    "service_function_coverage_percent": 100.0,
+    "data_task_count": 5,
+    "generated_data_task_functions": 5,
+    "data_task_code_generation_percent": 100.0,
+    "command_task_count": 10,
+    "generated_command_task_functions": 10,
+    "pyspark_dataframe_methods_found": [
+      "agg",
+      "dropDuplicates",
+      "filter",
+      "groupBy",
+      "join",
+      "select",
+      "withColumn"
+    ],
+    "operation_coverage": {
+      "total_operations": 276,
+      "operations_with_code_marker": 276,
+      "implemented_operations": 0,
+      "inferred_operations": 276,
+      "unsupported_operations": 0,
+      "unmarked_operations": 0,
+      "operation_representation_percent": 100.0,
+      "strict_implementation_percent": 0.0,
+      "missing_operation_refs": []
+    },
+    "execution_performed": false,
+    "data_validation_performed": false,
+    "per_service_generation": [
+      {
+        "service_id": "ms07zo8j",
+        "service": "s_m_TDR_LOAD_PRCS_BTCH_DTL_LOG",
+        "service_type": "DATA_TASK",
+        "function_name": "execute_s_m_tdr_load_prcs_btch_dtl_log",
+        "status": "GENERATED",
+        "evidence_operation_count": 20
+      },
+      {
+        "service_id": "ms07zo9m",
+        "service": "cmd_WRKSTN_LKP_SP",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_wrkstn_lkp_sp",
+        "status": "GENERATED",
+        "evidence_operation_count": 8
+      },
+      {
+        "service_id": "ms07zo9j",
+        "service": "cmd_WRKSTN_PRDCT_LKP_SP",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_wrkstn_prdct_lkp_sp",
+        "status": "GENERATED",
+        "evidence_operation_count": 8
+      },
+      {
+        "service_id": "ms07zo8z",
+        "service": "s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+        "service_type": "DATA_TASK",
+        "function_name": "execute_s_m_tim_stg_unq_wrkstn_nomtch_sync",
+        "status": "GENERATED",
+        "evidence_operation_count": 27
+      },
+      {
+        "service_id": "ms07zoe8",
+        "service": "Post_Session_Success_Command_s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_post_session_success_command_s_m_tim_stg_unq_wrkstn_nomtch_sync",
+        "status": "GENERATED",
+        "evidence_operation_count": 6
+      },
+      {
+        "service_id": "ms07zo94",
+        "service": "cmd_TDR_ETL_Job_Failed",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_tdr_etl_job_failed",
+        "status": "GENERATED",
+        "evidence_operation_count": 6
+      },
+      {
+        "service_id": "ms07zo8n",
+        "service": "s_m_TDR_STG_SRC_TGT_CNT_gen",
+        "service_type": "DATA_TASK",
+        "function_name": "execute_s_m_tdr_stg_src_tgt_cnt_gen",
+        "status": "GENERATED",
+        "evidence_operation_count": 16
+      },
+      {
+        "service_id": "ms07zo8v",
+        "service": "s_m_TDR_LOAD_PRCS_BATCH_FILE_DTLS",
+        "service_type": "DATA_TASK",
+        "function_name": "execute_s_m_tdr_load_prcs_batch_file_dtls",
+        "status": "GENERATED",
+        "evidence_operation_count": 26
+      },
+      {
+        "service_id": "ms07zo8r",
+        "service": "s_m_TDR_UPD_CONFIG_EVNT_BATCH_LOG_DTLS",
+        "service_type": "DATA_TASK",
+        "function_name": "execute_s_m_tdr_upd_config_evnt_batch_log_dtls",
+        "status": "GENERATED",
+        "evidence_operation_count": 22
+      },
+      {
+        "service_id": "ms07zo9d",
+        "service": "cmd_SHAREPOINT_UPLOAD_PRDCT",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_sharepoint_upload_prdct",
+        "status": "GENERATED",
+        "evidence_operation_count": 8
+      },
+      {
+        "service_id": "ms07zo9s",
+        "service": "cmd_LKP_File_Archive_prdct",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_lkp_file_archive_prdct",
+        "status": "GENERATED",
+        "evidence_operation_count": 6
+      },
+      {
+        "service_id": "ms07zo9g",
+        "service": "cmd_File_Archive_prdct",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_file_archive_prdct",
+        "status": "GENERATED",
+        "evidence_operation_count": 6
+      },
+      {
+        "service_id": "ms07zo97",
+        "service": "cmd_SHAREPOINT_UPLOAD",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_sharepoint_upload",
+        "status": "GENERATED",
+        "evidence_operation_count": 16
+      },
+      {
+        "service_id": "ms07zo9a",
+        "service": "cmd_File_Archive",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_file_archive",
+        "status": "GENERATED",
+        "evidence_operation_count": 12
+      },
+      {
+        "service_id": "ms07zo9p",
+        "service": "cmd_LKP_File_Archive",
+        "service_type": "COMMAND_TASK",
+        "function_name": "execute_cmd_lkp_file_archive",
+        "status": "GENERATED",
+        "evidence_operation_count": 12
+      }
+    ],
+    "service_generation_failures": 0,
+    "generation_strategy": "SERVICE_SCOPED_LLM_CHUNKING",
+    "llm_requests": 15
+  },
+  "per_service_generation": [
+    {
+      "service_id": "ms07zo8j",
+      "service": "s_m_TDR_LOAD_PRCS_BTCH_DTL_LOG",
+      "service_type": "DATA_TASK",
+      "function_name": "execute_s_m_tdr_load_prcs_btch_dtl_log",
+      "status": "GENERATED",
+      "evidence_operation_count": 20
+    },
+    {
+      "service_id": "ms07zo9m",
+      "service": "cmd_WRKSTN_LKP_SP",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_wrkstn_lkp_sp",
+      "status": "GENERATED",
+      "evidence_operation_count": 8
+    },
+    {
+      "service_id": "ms07zo9j",
+      "service": "cmd_WRKSTN_PRDCT_LKP_SP",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_wrkstn_prdct_lkp_sp",
+      "status": "GENERATED",
+      "evidence_operation_count": 8
+    },
+    {
+      "service_id": "ms07zo8z",
+      "service": "s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+      "service_type": "DATA_TASK",
+      "function_name": "execute_s_m_tim_stg_unq_wrkstn_nomtch_sync",
+      "status": "GENERATED",
+      "evidence_operation_count": 27
+    },
+    {
+      "service_id": "ms07zoe8",
+      "service": "Post_Session_Success_Command_s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_post_session_success_command_s_m_tim_stg_unq_wrkstn_nomtch_sync",
+      "status": "GENERATED",
+      "evidence_operation_count": 6
+    },
+    {
+      "service_id": "ms07zo94",
+      "service": "cmd_TDR_ETL_Job_Failed",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_tdr_etl_job_failed",
+      "status": "GENERATED",
+      "evidence_operation_count": 6
+    },
+    {
+      "service_id": "ms07zo8n",
+      "service": "s_m_TDR_STG_SRC_TGT_CNT_gen",
+      "service_type": "DATA_TASK",
+      "function_name": "execute_s_m_tdr_stg_src_tgt_cnt_gen",
+      "status": "GENERATED",
+      "evidence_operation_count": 16
+    },
+    {
+      "service_id": "ms07zo8v",
+      "service": "s_m_TDR_LOAD_PRCS_BATCH_FILE_DTLS",
+      "service_type": "DATA_TASK",
+      "function_name": "execute_s_m_tdr_load_prcs_batch_file_dtls",
+      "status": "GENERATED",
+      "evidence_operation_count": 26
+    },
+    {
+      "service_id": "ms07zo8r",
+      "service": "s_m_TDR_UPD_CONFIG_EVNT_BATCH_LOG_DTLS",
+      "service_type": "DATA_TASK",
+      "function_name": "execute_s_m_tdr_upd_config_evnt_batch_log_dtls",
+      "status": "GENERATED",
+      "evidence_operation_count": 22
+    },
+    {
+      "service_id": "ms07zo9d",
+      "service": "cmd_SHAREPOINT_UPLOAD_PRDCT",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_sharepoint_upload_prdct",
+      "status": "GENERATED",
+      "evidence_operation_count": 8
+    },
+    {
+      "service_id": "ms07zo9s",
+      "service": "cmd_LKP_File_Archive_prdct",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_lkp_file_archive_prdct",
+      "status": "GENERATED",
+      "evidence_operation_count": 6
+    },
+    {
+      "service_id": "ms07zo9g",
+      "service": "cmd_File_Archive_prdct",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_file_archive_prdct",
+      "status": "GENERATED",
+      "evidence_operation_count": 6
+    },
+    {
+      "service_id": "ms07zo97",
+      "service": "cmd_SHAREPOINT_UPLOAD",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_sharepoint_upload",
+      "status": "GENERATED",
+      "evidence_operation_count": 16
+    },
+    {
+      "service_id": "ms07zo9a",
+      "service": "cmd_File_Archive",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_file_archive",
+      "status": "GENERATED",
+      "evidence_operation_count": 12
+    },
+    {
+      "service_id": "ms07zo9p",
+      "service": "cmd_LKP_File_Archive",
+      "service_type": "COMMAND_TASK",
+      "function_name": "execute_cmd_lkp_file_archive",
+      "status": "GENERATED",
+      "evidence_operation_count": 12
+    }
+  ],
+  "generation_errors": [],
+  "assumptions": [
+    "Operation evidence is matched by explicit service references when available.",
+    "Unmatched operations are partitioned across data-task prompts and marked INFERRED.",
+    "Generated PySpark is best-effort, not verified equivalent to IDMC mapping behavior."
+  ],
+  "unsupported_items": [],
+  "execution_performed": false,
+  "data_validation_performed": false
+}

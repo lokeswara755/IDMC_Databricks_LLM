@@ -2773,3 +2773,263 @@ IDMC METADATA
                 f"{step.get('type')}"
 
             )
+
+
+    # ============================================================
+    # TASKFLOW ANALYSIS (SEPARATE FROM MAPPING/PYSPARK GENERATION)
+    # ============================================================
+
+    @staticmethod
+    def _compact_taskflow_input(taskflow_input):
+        """Bound Taskflow evidence while retaining every link record."""
+        if not isinstance(taskflow_input, dict):
+            raise TypeError("taskflow_input must be a dictionary.")
+
+        parser_evidence = taskflow_input.get("parser_evidence") or {}
+        graph = taskflow_input.get("orchestration_graph") or {}
+        validation = taskflow_input.get("validation") or {}
+        if not isinstance(parser_evidence, dict) or not isinstance(graph, dict):
+            raise ValueError("Taskflow input is missing parser_evidence/orchestration_graph.")
+
+        def compact_service(item):
+            if not isinstance(item, dict):
+                return {"value": str(item)[:300]}
+            keys = (
+                "id", "name", "title", "service_name", "service_type",
+                "parent_id", "flow_id"
+            )
+            return {key: item.get(key) for key in keys if item.get(key) is not None}
+
+        def compact_link(item):
+            if not isinstance(item, dict):
+                return {"raw": str(item)[:500]}
+            keys = (
+                "link_id", "flow_id", "owner_id", "owner_type",
+                "container_context", "source_id", "target_id", "edge_type",
+                "condition_task_references", "source_resolution",
+                "source_confirmed_by_xml", "target_confirmed_by_xml", "reason"
+            )
+            result = {key: item.get(key) for key in keys if item.get(key) is not None}
+            condition = item.get("condition_text")
+            if condition:
+                result["condition_text"] = str(condition)[:1500]
+            return result
+
+        def compact_edge(item):
+            if not isinstance(item, dict):
+                return {"raw": str(item)[:300]}
+            return {
+                key: item.get(key)
+                for key in ("source_id", "target_id", "link_id", "edge_type",
+                            "source_resolution", "confirmed", "source_confirmed_by_xml")
+                if item.get(key) is not None
+            }
+
+        links = graph.get("links") or []
+        if not links:
+            links = (graph.get("inferred_dependency_edges") or []) + (
+                graph.get("unresolved_links") or []
+            )
+        compact_links = [compact_link(item) for item in links]
+
+        # Preserve every link. Fail closed rather than silently sending a partial graph.
+        expected_link_count = len(links)
+        if len(compact_links) != expected_link_count:
+            raise ValueError("Taskflow compaction did not preserve all link records.")
+
+        compact = {
+            "asset_type": taskflow_input.get("asset_type", "IDMC_TASKFLOW"),
+            "taskflow": taskflow_input.get("taskflow") or {},
+            "parser_evidence": {
+                "parameters": parser_evidence.get("parameters", []),
+                "temp_fields": parser_evidence.get("temp_fields", []),
+                "services": [
+                    compact_service(item)
+                    for item in (parser_evidence.get("services") or [])
+                ],
+                "flow_summaries": parser_evidence.get("flow_summaries", []),
+                "node_type_counts": parser_evidence.get("node_type_counts", {}),
+            },
+            "orchestration_graph": {
+                "containment_edges": [
+                    compact_edge(item)
+                    for item in (graph.get("containment_edges") or [])
+                ],
+                "inferred_dependency_edges": [
+                    compact_link(item)
+                    for item in (graph.get("inferred_dependency_edges") or [])
+                ],
+                "condition_dependency_evidence": graph.get(
+                    "condition_dependency_evidence", []
+                ),
+                "links": compact_links,
+                "unresolved_links": [
+                    compact_link(item)
+                    for item in (graph.get("unresolved_links") or [])
+                ],
+            },
+            "validation": validation,
+            "known_limitations": taskflow_input.get("known_limitations", []),
+            "input_integrity": {
+                "link_count_supplied": expected_link_count,
+                "link_count_retained": len(compact_links),
+                "all_links_retained": len(compact_links) == expected_link_count,
+            },
+        }
+        if not compact["input_integrity"]["all_links_retained"]:
+            raise ValueError("Not all Taskflow links were retained during compaction.")
+        return compact
+
+    def generate_taskflow_analysis(self, taskflow_input, max_tokens=6000):
+        """
+        Ask the configured Databricks model for Taskflow migration analysis.
+        This method does not generate mapping PySpark and does not execute anything.
+        Existing generate() behavior remains unchanged.
+        """
+        compact_input = self._compact_taskflow_input(taskflow_input)
+        evidence_json = json.dumps(
+            compact_input, ensure_ascii=False, separators=(",", ":"), default=str
+        )
+
+        prompt = f"""
+You are a senior Informatica IDMC-to-Databricks migration architect.
+
+Analyze the supplied IDMC TASKFLOW export. This is an orchestration analysis only.
+Do not generate PySpark mapping code. Do not execute or claim to execute any task.
+
+EVIDENCE RULES:
+- Use only the supplied evidence. Separate XML facts, inferred relationships,
+  condition-reference evidence, and assumptions.
+- Every supplied link record is included. Account for the full link inventory
+  using counts and classifications; do not claim a source relationship is XML-confirmed.
+- The XML links have id and targetId but no sourceId. A preceding-activity
+  relationship is inferred, never XML-confirmed.
+- Condition references to $temp task outputs are evidence of condition inputs,
+  not proof of a link's source.
+- The XML is a Taskflow export, not a complete mapping-definition export.
+  Mapping tasks may be named, but their internal mapping transformations,
+  columns, SQL, merge keys, and business rules are not supplied here.
+- Do not invent missing task names, execution order, branch outcomes, schemas,
+  parameters, command behavior, or mapping logic.
+- Identify unresolved links and explain the impact of missing source information.
+- Distinguish data-task services from command-task services.
+- Discuss exclusive/parallel containers, event/catch handlers, assignments,
+  conditions and taskflow parameters only where present in the evidence.
+- Recommend a Databricks Jobs/Workflows design at orchestration level.
+  Treat command tasks as external-command integration candidates requiring
+  implementation details/credentials/host context; do not fabricate commands.
+- State clearly what can be migrated from this XML and what requires mapping
+  exports or additional evidence.
+- Do not say migration is complete or production-ready unless the evidence proves it.
+
+Return ONLY one valid JSON object with exactly these top-level keys:
+{{
+  "taskflow_summary": {{
+    "taskflow_name": "",
+    "taskflow_guid": "",
+    "asset_type": "IDMC_TASKFLOW",
+    "observed_counts": {{}},
+    "purpose_and_scope": ""
+  }},
+  "orchestration_analysis": {{
+    "confirmed_xml_facts": [],
+    "inferred_relationships": [],
+    "condition_reference_evidence": [],
+    "branch_and_container_analysis": [],
+    "error_handling_analysis": [],
+    "link_accounting": {{
+      "total_links_received": 0,
+      "links_with_inferred_sources": 0,
+      "links_with_unresolved_sources": 0,
+      "links_with_missing_targets": 0,
+      "source_ids_present_in_xml": false
+    }}
+  }},
+  "service_migration_plan": [
+    {{
+      "service_name": "",
+      "service_type": "",
+      "observed_role": "",
+      "databricks_migration_candidate": "",
+      "required_evidence_or_blocker": ""
+    }}
+  ],
+  "databricks_target_design": {{
+    "workflow_structure": [],
+    "task_dependencies": [],
+    "parameters_and_configuration": [],
+    "retry_and_failure_handling": [],
+    "external_command_handling": [],
+    "implementation_notes": []
+  }},
+  "assumptions_and_gaps": [],
+  "readiness_status": {{
+    "status": "REVIEW_REQUIRED",
+    "can_design_orchestration": true,
+    "can_generate_exact_mapping_logic_from_this_xml": false,
+    "can_execute_migration": false,
+    "blocking_gaps": []
+  }},
+  "next_actions": []
+}}
+
+Keep the response concise but specific. Use empty arrays where evidence is absent.
+Do not add markdown fences or prose outside JSON.
+
+TASKFLOW EVIDENCE JSON:
+{evidence_json}
+"""
+
+        response_text = self._call_llm(
+            prompt, max_tokens=min(int(max_tokens), self.max_tokens)
+        )
+        result = self._parse_response(response_text)
+        if not isinstance(result, dict):
+            raise ValueError("Taskflow LLM response must be a JSON object.")
+
+        required_keys = {
+            "taskflow_summary", "orchestration_analysis",
+            "service_migration_plan", "databricks_target_design",
+            "assumptions_and_gaps", "readiness_status", "next_actions"
+        }
+        missing = sorted(required_keys - set(result))
+        if missing:
+            raise ValueError(
+                "Taskflow LLM response is missing required keys: "
+                + ", ".join(missing)
+            )
+
+        # Attach traceability metadata from the actual input, not model claims.
+        result["_generation_metadata"] = {
+            "model": self.model,
+            "taskflow_name": (compact_input.get("taskflow") or {}).get("name"),
+            "input_link_count": compact_input["input_integrity"]["link_count_retained"],
+            "all_input_links_retained": compact_input["input_integrity"]["all_links_retained"],
+            "taskflow_execution_performed": False,
+            "pyspark_generation_performed": False,
+        }
+        return result
+
+    @staticmethod
+    def print_taskflow_result(result):
+        """Print a compact summary of a Taskflow analysis response."""
+        summary = result.get("taskflow_summary") or {}
+        orchestration = result.get("orchestration_analysis") or {}
+        link_accounting = orchestration.get("link_accounting") or {}
+        readiness = result.get("readiness_status") or {}
+
+        print("\\nTASKFLOW LLM ANALYSIS")
+        print("=" * 70)
+        print("Taskflow:", summary.get("taskflow_name"))
+        print("Services in migration plan:", len(result.get("service_migration_plan", [])))
+        print("Links received:", link_accounting.get("total_links_received"))
+        print("Inferred-source links:", link_accounting.get("links_with_inferred_sources"))
+        print("Unresolved-source links:", link_accounting.get("links_with_unresolved_sources"))
+        print("Readiness:", readiness.get("status"))
+        print("Execution performed: NO")
+        print("\\nASSUMPTIONS / GAPS")
+        for item in result.get("assumptions_and_gaps", []):
+            print("-", item)
+        print("\\nNEXT ACTIONS")
+        for item in result.get("next_actions", []):
+            print("-", item)

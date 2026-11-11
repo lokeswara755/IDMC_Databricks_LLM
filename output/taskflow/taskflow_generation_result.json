@@ -1,0 +1,48 @@
+{
+  "taskflow_name": "wf_s_m_TIM_STG_UNQ_WRKSTN_NOMTCH_SYNC",
+  "generated_file": "/Workspace/Users/lokeswaraseetaramasastry.k@tcs.com/IDMC_Databricks_LLM/output/taskflow/generated_wf_s_m_tim_stg_unq_wrkstn_nomtch_sync.py",
+  "metadata_file": "/Workspace/Users/lokeswaraseetaramasastry.k@tcs.com/IDMC_Databricks_LLM/output/taskflow/generated_wf_s_m_tim_stg_unq_wrkstn_nomtch_sync.metadata.json",
+  "validation_file": "/Workspace/Users/lokeswaraseetaramasastry.k@tcs.com/IDMC_Databricks_LLM/output/taskflow/generated_wf_s_m_tim_stg_unq_wrkstn_nomtch_sync.validation.json",
+  "model": "databricks-gpt-oss-120b",
+  "generation_method": "DETERMINISTIC_EVIDENCE_BASED",
+  "generation_status": "GENERATED",
+  "parameter_count": 37,
+  "temp_field_count": 42,
+  "service_count": 15,
+  "operation_count": 276,
+  "control_flow_node_count": 77,
+  "link_count": 99,
+  "inferred_dependency_count": 30,
+  "unresolved_link_count": 69,
+  "code_validation": {
+    "status": "PARTIAL",
+    "valid": true,
+    "checks": {
+      "python_syntax": "PASS",
+      "service_handler_coverage": "PASS",
+      "metadata_integrity": "PASS",
+      "unsafe_execution": "PASS",
+      "mapping_semantics": "NOT_VALIDATED",
+      "task_execution": "NOT_RUN",
+      "data_validation": "NOT_RUN"
+    },
+    "errors": [],
+    "warnings": [
+      "69 unresolved links remain; automatic orchestration is blocked.",
+      "Mapping definitions are absent; data transformation semantics cannot be validated."
+    ],
+    "service_count": 15,
+    "covered_handler_count": 15,
+    "handler_coverage_percentage": 100.0,
+    "missing_handlers": [],
+    "unsafe_calls": [],
+    "data_task_count": 5,
+    "command_task_count": 10,
+    "execution_performed": false,
+    "data_validation_performed": false
+  },
+  "execution_status": "NOT_RUN",
+  "data_validation_status": "NOT_RUN",
+  "execution_performed": false,
+  "data_validation_performed": false
+}
