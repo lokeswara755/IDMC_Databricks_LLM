@@ -108,38 +108,53 @@ class TaskflowLLMInputBuilder:
         )
 
         # --------------------------------------------------
-        # 3. Extract services from graph nodes
+        # 3. Extract complete service metadata
         # --------------------------------------------------
+        # The parser's service records are authoritative. They preserve
+        # IDMC service types such as ICSExecuteDataTask and
+        # ICSExecuteCommandTask. Graph nodes represent orchestration
+        # structure and may not contain complete service metadata.
 
         nodes = _as_list(
             taskflow_graph.get("nodes")
         )
 
-        services = []
+        parser_services = _as_list(
+            taskflow.get("services")
+        )
 
-        for node in nodes:
+        if parser_services:
+            services = _clean_raw_xml(parser_services)
+        else:
+            # Fallback only for parser versions that do not expose
+            # taskflow.services.
+            services = []
 
-            if not isinstance(node, dict):
-                continue
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
 
-            if node.get("element_type") != "service":
-                continue
+                if str(node.get("element_type", "")).lower() != "service":
+                    continue
 
-            services.append({
-                "id": node.get("id"),
-                "name": node.get("name"),
-                "title": node.get("title"),
-                "service_name": node.get("service_name"),
-                "service_type": node.get("service_type") or node.get("type"),
-                "parent_id": node.get("parent_id"),
-                "flow_id": node.get("flow_id"),
-            })
+                services.append({
+                    "id": node.get("id"),
+                    "name": node.get("name"),
+                    "title": node.get("title"),
+                    "service_name": node.get("service_name"),
+                    "service_type": (
+                        node.get("service_type")
+                        or node.get("serviceType")
+                        or node.get("type")
+                    ),
+                    "parent_id": node.get("parent_id"),
+                    "flow_id": node.get("flow_id"),
+                })
 
-        # Fallback to parser services if graph nodes
-        # do not contain service records.
         if not services:
-            services = _as_list(
-                taskflow.get("services")
+            raise ValueError(
+                "No Taskflow service metadata found in parser output "
+                "or graph nodes."
             )
 
         # --------------------------------------------------

@@ -96,13 +96,20 @@ class TaskflowCodeGenerator:
 
         services = cls._list(parser.get("services"))
         graph_nodes = cls._list(parser.get("graph_nodes"))
+
+        # Prefer complete original parser service records.
+        if not services:
+            services = cls._list(metadata.get("services"))
+        if not services:
+            services = cls._list(taskflow.get("services"))
+        if not graph_nodes:
+            graph_nodes = cls._list(graph.get("nodes"))
         if not services:
             services = [
                 n for n in graph_nodes
-                if isinstance(n, dict) and n.get("element_type") == "service"
+                if isinstance(n, dict)
+                and str(n.get("element_type", "")).lower() == "service"
             ]
-        if not graph_nodes:
-            graph_nodes = cls._list(graph.get("nodes"))
 
         operations = cls._list(parser.get("operations"))
         if not operations:
@@ -176,12 +183,44 @@ class TaskflowCodeGenerator:
 
     @staticmethod
     def _service_type(service: Dict[str, Any]) -> str:
-        values = " ".join(str(service.get(k, "")) for k in
-                           ("service_name", "service_type", "type", "name", "title")).lower()
-        if "icsexecutedatatask" in values or "data_task" in values or "mappingtask" in values:
+        """Classify a service from its original IDMC type metadata."""
+        if not isinstance(service, dict):
+            return "OTHER_SERVICE"
+
+        keys = (
+            "service_name", "service_type", "serviceType", "type",
+            "task_type", "taskType", "object_type", "objectType",
+            "name", "title",
+        )
+        values = [
+            str(service.get(key))
+            for key in keys
+            if service.get(key) is not None
+        ]
+
+        attributes = service.get("attributes")
+        if isinstance(attributes, dict):
+            values.extend(
+                str(attributes.get(key))
+                for key in keys
+                if attributes.get(key) is not None
+            )
+
+        normalized = " ".join(values).replace("-", "_").lower()
+
+        if (
+            "icsexecutedatatask" in normalized
+            or "data_task" in normalized
+            or "mappingtask" in normalized
+        ):
             return "DATA_TASK"
-        if "icsexecutecommandtask" in values or "command_task" in values:
+
+        if (
+            "icsexecutecommandtask" in normalized
+            or "command_task" in normalized
+        ):
             return "COMMAND_TASK"
+
         return "OTHER_SERVICE"
 
     @classmethod
@@ -199,7 +238,12 @@ class TaskflowCodeGenerator:
         for index, service in enumerate(compact["services"], start=1):
             if not isinstance(service, dict):
                 continue
-            sid = str(service.get("id") or service.get("guid") or f"service_{index:02d}")
+            sid = str(
+                service.get("id")
+                or service.get("guid")
+                or service.get("service_id")
+                or f"service_{index:02d}"
+            )
             title = (service.get("title") or service.get("name")
                      or service.get("service_name") or sid)
             function = "execute_" + cls._safe_identifier(title, f"service_{index:02d}")
@@ -672,6 +716,19 @@ def migration_report():
 
         compact = self.compact_input(taskflow_input)
         manifest = self._service_manifest(compact)
+
+        # Stop before making LLM calls if service metadata exists but
+        # none of the supported IDMC task types can be classified.
+        if compact["services"] and (
+            compact["counts"]["data_task_count"]
+            + compact["counts"]["command_task_count"] == 0
+        ):
+            raise ValueError(
+                "Service metadata was found, but no DATA_TASK or COMMAND_TASK "
+                "services could be classified. Inspect parser_evidence['services'] "
+                "and the original IDMC type fields before calling the LLM."
+            )
+
         if not manifest:
             raise ValueError(
                 "No Taskflow services were found. Check TaskflowLLMInputBuilder output."
@@ -865,8 +922,10 @@ UNSUPPORTED_ITEMS = []
             "per_service_generation": per_service_results,
             "generation_errors": generation_errors,
             "assumptions": [
-                "Operations are matched to a service by explicit references when available.",
-                "Unmatched operations may be partitioned across data-task prompts as an inference.",
+                "Original parser service records are preferred over graph-derived service nodes.",
+                "Service function coverage means a function was generated; it does not prove semantic implementation.",
+                "Operations are associated with a service only when the supplied evidence explicitly supports that association.",
+                "Operations without verified service ownership remain UNASSIGNED and are excluded from implementation coverage.",
                 "Generated PySpark is best-effort and is not verified equivalent to original IDMC mapping behavior.",
                 "Task execution and data validation have not been performed by this generator.",
             ],
